@@ -1,0 +1,76 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "invest-watch"
+version = "0.1.0"
+description = "Automated daily press monitoring for portfolio companies — CLI + SQLite + watsonx.ai"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+dependencies = [
+    # ── Database ──────────────────────────────────────────────────────────
+    # sqlite3 is stdlib — no extra dependency needed
+
+    # ── Configuration ─────────────────────────────────────────────────────
+    # tomllib is stdlib (Python ≥ 3.11) — no extra dependency needed
+    "python-dotenv>=1.0",           # loads .env into os.environ
+
+    # ── HTTP & content extraction ─────────────────────────────────────────
+    "httpx>=0.27",                  # async-capable HTTP client, follow_redirects
+    "trafilatura>=1.12",            # HTML → main text + date extraction
+    "feedparser>=6.0",              # RSS / Atom parsing
+    "beautifulsoup4>=4.12",         # complementary HTML parsing (meta, JSON-LD)
+    "lxml>=5.2",                    # fast parser backend for bs4
+
+    # ── Date & language detection ─────────────────────────────────────────
+    "dateparser>=1.2",              # multilingual / relative dates
+    "lingua-language-detector>=2.0", # accurate language detection (300-char window)
+    "langdetect>=1.0",              # fallback language detector
+
+    # ── Search engines ────────────────────────────────────────────────────
+    "duckduckgo-search>=6.2",       # DDG fallback (no API key)
+
+    # ── Deduplication ─────────────────────────────────────────────────────
+    "datasketch>=1.6",              # MinHash / LSH for content near-duplicate detection
+
+    # ── LLM — IBM watsonx.ai ──────────────────────────────────────────────
+    "ibm-watsonx-ai>=1.1.22",       # ModelInference, Credentials, IAM auth
+
+    # ── Timezone handling ─────────────────────────────────────────────────
+    "tzdata>=2024.1",               # IANA timezone database (required on Windows)
+
+    # ── V2 web interface (FastAPI) ────────────────────────────────────────
+    "fastapi>=0.111",               # async web framework (127.0.0.1 only)
+    "uvicorn[standard]>=0.29",      # ASGI server for FastAPI
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2",
+    "pytest-cov>=5.0",
+    "pytest-asyncio>=0.23",
+    "httpx",                        # also used as TestClient for FastAPI
+    "respx>=0.21",                  # httpx request mocking
+]
+
+[project.scripts]
+invest-watch = "invest_watch.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["invest_watch*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "--cov=invest_watch --cov-report=term-missing"
+
+[tool.coverage.run]
+source = ["invest_watch"]
+omit = ["invest_watch/web_ui.py", "invest_watch/insight_engine.py"]
+
+[tool.coverage.report]
+fail_under = 80

@@ -1,0 +1,1 @@
+"""Test suite for invest-watch (offline, no API keys — specs §15)."""

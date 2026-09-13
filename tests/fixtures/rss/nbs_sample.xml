@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>NBS press releases</title>
+    <item>
+      <title>National Bureau of Statistics CPI August 2026</title>
+      <link>https://www.example.invalid/nbs/cpi</link>
+      <pubDate>Fri, 11 Sep 2026 02:00:00 GMT</pubDate>
+    </item>
+  </channel>
+</rss>

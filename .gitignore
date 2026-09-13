@@ -1,0 +1,38 @@
+﻿# ── Runtime data (generated at runtime, not committed) ───────────────────────
+data/
+logs/
+reports/
+backups/
+
+# ── Secrets ───────────────────────────────────────────────────────────────────
+.env
+conf/config.toml
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.class
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Testing & coverage ────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+*\[conflicted]\*
+*conflicted*
+
+# ── IDEs & OS ─────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

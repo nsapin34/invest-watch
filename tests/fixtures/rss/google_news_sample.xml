@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Google News</title>
+    <item>
+      <title>BYD expands European production</title>
+      <link>https://www.example.invalid/news/byd-europe</link>
+      <pubDate>Fri, 11 Sep 2026 15:00:00 GMT</pubDate>
+      <guid isPermaLink="false">gnews-byd-europe</guid>
+    </item>
+  </channel>
+</rss>
