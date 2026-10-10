@@ -142,9 +142,9 @@ def test_apply_migrations_is_idempotent():
     db = DatabaseManager(":memory:")
     first = db.apply_migrations()
     second = db.apply_migrations()
-    assert len(first) == 3  # v001 + v002 + v003
+    assert len(first) == 11  # v001 .. v011
     assert second == []
-    assert db.schema_version == 3
+    assert db.schema_version == 11
     db.close()
 
 

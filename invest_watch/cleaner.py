@@ -93,6 +93,41 @@ def _looks_like_paywall(html: str, text: str) -> bool:
     return any(marker in blob for marker in _PAYWALL_MARKERS)
 
 
+def is_pdf(content: bytes, content_type: str | None = None, url: str | None = None) -> bool:
+    """True when a fetched body is a PDF (content-type, magic bytes or URL)."""
+    if content_type and "pdf" in content_type.lower():
+        return True
+    if content[:5] == b"%PDF-":
+        return True
+    return bool(url) and str(url).lower().split("?", 1)[0].endswith(".pdf")
+
+
+def clean_pdf(content: bytes, *, min_content_chars: int = 200) -> CleanedDocument:
+    """Extract text from a PDF (e.g. HKEX announcements) with pypdf.
+
+    Never raises: an unreadable PDF yields an empty, ``metadata_only`` document
+    so the pipeline keeps the candidate's own title.
+    """
+    text = ""
+    try:
+        import io as _io
+
+        from pypdf import PdfReader
+
+        reader = PdfReader(_io.BytesIO(content))
+        text = "\n".join((page.extract_text() or "") for page in reader.pages)
+    except Exception as exc:  # noqa: BLE001 - degraded: keep candidate title
+        logger.warning("pdf extraction failed: %s", exc)
+    text = normalise_whitespace(text)
+    return CleanedDocument(
+        text=text,
+        excerpt=excerpt_of(text),
+        word_count=len(text.split()) if text else 0,
+        content_hash=content_hash(text) if text else None,
+        metadata_only=len(text) < min_content_chars,
+    )
+
+
 def clean_html(
     html: str,
     *,

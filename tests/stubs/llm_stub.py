@@ -34,7 +34,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-from invest_watch.llm_client import LLMDegradedError
+from invest_watch.llm_client import LLMDegradedError, extract_json_payload
 
 
 @dataclass
@@ -87,11 +87,19 @@ class LLMStub:
     ) -> dict[str, Any]:
         """Call :meth:`generate` and parse as JSON.
 
-        If the canned response is not valid JSON, raises
-        :exc:`~invest_watch.llm_client.LLMDegradedError` (mirrors the real
-        client's behaviour after the corrective attempt fails).
+        Mirrors the real client's fence/preamble-tolerant parsing first
+        (:func:`invest_watch.llm_client.extract_json_payload`).  If that fails,
+        falls back to a plain ``json.loads`` so tests can still exercise the
+        *schema-validation* failure path (non-dict payloads → 'invalid') — the
+        real client raises :exc:`LLMDegradedError` for those instead.
+        Truly unparseable text raises :exc:`LLMDegradedError`, mirroring the
+        real client's post-corrective behaviour.
         """
         raw = self.generate(prompt, content_hash=content_hash)
+        try:
+            return extract_json_payload(raw)
+        except (ValueError, json.JSONDecodeError):
+            pass
         try:
             return json.loads(raw)
         except json.JSONDecodeError as exc:

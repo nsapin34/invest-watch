@@ -13,13 +13,18 @@ Covers all spec §8.5 / §8.6 / architecture Step 4 requirements:
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from invest_watch.llm_client import (
     LLMClientConfig,
     LLMDegradedError,
+    LLMTruncatedError,
     WatsonxLLMClient,
+    _SDKChatModel,
     build_llm_client,
+    extract_json_payload,
     llm_client_config_from_section,
 )
 from tests.stubs.llm_stub import LLMStub
@@ -528,4 +533,156 @@ class TestGenerateJSON:
         with pytest.raises(LLMDegradedError):
             stub.generate_json("prompt")
         assert stub.is_degraded is True
+
+
+# ── extract_json_payload — robust JSON extraction (P0: run #2 root cause) ─────
+
+
+class TestExtractJsonPayload:
+    def test_plain_json(self):
+        assert extract_json_payload('{"a": 1}') == {"a": 1}
+
+    def test_fenced_json(self):
+        raw = '```json\n{"a": 1}\n```'
+        assert extract_json_payload(raw) == {"a": 1}
+
+    def test_prose_around_json(self):
+        raw = 'Voici le JSON demandé:\n{"a": 1, "nested": {"b": 2}}\nCordialement.'
+        assert extract_json_payload(raw) == {"a": 1, "nested": {"b": 2}}
+
+    def test_braces_inside_strings_do_not_break_balance(self):
+        raw = 'prefix {"code": "if (a) { b }", "n": 1} suffix'
+        assert extract_json_payload(raw) == {"code": "if (a) { b }", "n": 1}
+
+    def test_non_dict_payload_rejected(self):
+        with pytest.raises((ValueError, json.JSONDecodeError)):
+            extract_json_payload('["not", "a", "dict"]')
+
+    def test_no_object_found(self):
+        with pytest.raises((ValueError, json.JSONDecodeError)):
+            extract_json_payload("sorry, I cannot answer that")
+
+
+# ── JSON-failure circuit breaker (P0: run #2 burned 51 × 2 calls) ─────────────
+
+
+class TestJsonFailureCircuitBreaker:
+    """Consecutive unparseable JSON outputs must trip the circuit manually."""
+
+    def _always_bad_json_model(self):
+        class _AlwaysBadJSON:
+            def __init__(self):
+                self.calls = 0
+
+            def generate(self, *, prompt):
+                self.calls += 1
+                return {"results": [{"generated_text": "bad {json"}]}
+
+        return _AlwaysBadJSON()
+
+    def test_streak_opens_circuit_at_threshold(self):
+        client = _client(max_retries=0, threshold=3)
+        model = self._always_bad_json_model()
+        client._model = model
+        for _ in range(3):
+            with pytest.raises(LLMDegradedError):
+                client.generate_json("prompt")
+        assert client.is_degraded is True
+        # 3 generate_json × 2 calls (original + corrective) = 6 model calls
+        assert model.calls == 6
+
+    def test_subsequent_calls_refused_without_model(self):
+        client = _client(max_retries=0, threshold=1)
+        model = self._always_bad_json_model()
+        client._model = model
+        with pytest.raises(LLMDegradedError):
+            client.generate_json("prompt")
+        assert client.is_degraded is True
+
+        quiet = self._always_bad_json_model()
+        client._model = quiet
+        with pytest.raises(LLMDegradedError):
+            client.generate_json("another")
+        assert quiet.calls == 0  # refused at the gate
+
+    def test_success_resets_streak(self):
+        client = _client(max_retries=0, threshold=3)
+        model = self._always_bad_json_model()
+        client._model = model
+        with pytest.raises(LLMDegradedError):
+            client.generate_json("p1")
+        with pytest.raises(LLMDegradedError):
+            client.generate_json("p2")
+        assert client.json_failure_streak == 2
+        client._model = _fake_model(['{"ok": true}'])
+        assert client.generate_json("p3") == {"ok": True}
+        assert client.json_failure_streak == 0
+        assert client.is_degraded is False
+
+    def test_raw_output_head_kept_for_post_mortem(self):
+        client = _client(max_retries=0, threshold=10)
+        client._model = self._always_bad_json_model()
+        with pytest.raises(LLMDegradedError):
+            client.generate_json("prompt")
+        assert client.last_raw_output == "bad {json"
+
+
+# ── _SDKChatModel adapter (chat endpoint + truncation) ────────────────────────
+
+
+class TestSDKChatModel:
+    def _fake_sdk(self, response=None):
+        class _FakeSDKModel:
+            def __init__(self):
+                self.calls = []
+
+            def chat(self, *, messages, params=None):
+                self.calls.append({"messages": messages, "params": params})
+                return response
+
+        return _FakeSDKModel()
+
+    def test_success_maps_chat_response(self):
+        sdk = self._fake_sdk(
+            response={
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": '{"a": 1}'},
+                    }
+                ]
+            }
+        )
+        cfg = LLMClientConfig(max_new_tokens=256, temperature=0.2, top_p=0.7)
+        adapter = _SDKChatModel(sdk, cfg)
+        result = adapter.generate(prompt="do things")
+        assert result == {"results": [{"generated_text": '{"a": 1}'}]}
+        assert len(sdk.calls) == 1
+        messages = sdk.calls[0]["messages"]
+        assert messages[0]["role"] == "system"
+        assert messages[-1] == {"role": "user", "content": "do things"}
+        params = sdk.calls[0]["params"]
+        assert params.max_tokens == 256
+        assert params.temperature == 0.2
+        assert params.top_p == 0.7
+
+    def test_truncation_raises_truncated_error(self):
+        sdk = self._fake_sdk(
+            response={
+                "choices": [
+                    {"finish_reason": "length", "message": {"content": '{"trunca'}}
+                ]
+            }
+        )
+        adapter = _SDKChatModel(sdk, LLMClientConfig(max_new_tokens=1200))
+        with pytest.raises(LLMTruncatedError, match="truncated"):
+            adapter.generate(prompt="p")
+        # LLMTruncatedError is an LLMDegradedError → callers degrade uniformly
+        assert issubclass(LLMTruncatedError, LLMDegradedError)
+
+    def test_unexpected_shape_raises_runtime_error(self):
+        sdk = self._fake_sdk(response={"unexpected": True})
+        adapter = _SDKChatModel(sdk, LLMClientConfig())
+        with pytest.raises(RuntimeError, match="unexpected chat response shape"):
+            adapter.generate(prompt="p")
 

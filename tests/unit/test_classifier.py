@@ -167,3 +167,34 @@ def test_classify_unrelated_article(db, setup_data):
 
     art_row = db.query_one("SELECT status, relevance_score FROM article WHERE id = ?", (article.id,))
     assert art_row["status"] == "unrelated"
+
+
+# -- Short ambiguous tickers (Air Liquide 'AI') ------------------------------
+
+@pytest.fixture
+def air_liquide(db):
+    return CompanyRepository(db).add(
+        Company(name="Air Liquide", ticker="AI"), aliases=["L'Air Liquide", "AIQUY"]
+    )
+
+
+def _company_names(db, title, content=""):
+    companies, *_ = Classifier(db).classify_text(title, content)
+    return {m.company.name for m in companies}
+
+
+def test_short_ticker_alone_does_not_match(db, air_liquide):
+    names = _company_names(db, "AI regulation: US, China, EU: three paths to regulating AI",
+                           "Governments race to regulate ai models.")
+    assert "Air Liquide" not in names
+
+
+def test_short_ticker_in_context_reinforces_name(db, air_liquide):
+    companies, *_ = Classifier(db).classify_text("Air Liquide (AI) raises guidance", "")
+    m = next(c for c in companies if c.company.name == "Air Liquide")
+    assert m.title_mentions == 2
+
+
+def test_short_ticker_equal_to_name_still_matches(db, setup_data):
+    assert "NIO" in _company_names(db, "NIO sales jump in September")
+    assert "BYD" in _company_names(db, "BYD sales record")

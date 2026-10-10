@@ -40,6 +40,7 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from .db_manager import DatabaseManager, utc_now_iso
 
@@ -100,6 +101,32 @@ class _RunContext:
     processing_errors: list[dict[str, Any]] = field(default_factory=list)
     short_links: dict[str, str] = field(default_factory=dict)  # short_code → url_original
 
+    # P1 item 10 — honest LLM reporting
+    llm_used_count: int = 0          # article summaries with llm_used=1
+    llm_degraded_count: int = 0      # article summaries with llm_used=0
+    digest_degraded_count: int = 0   # company/market digests with llm_used=0
+    top_failing_hosts: list[tuple[str, int]] = field(default_factory=list)  # (host, n)
+
+    @property
+    def total_summaries(self) -> int:
+        return self.llm_used_count + self.llm_degraded_count
+
+    @property
+    def has_degraded_llm(self) -> bool:
+        """True when ≥1 article summary (or digest) was produced degraded."""
+        return self.llm_degraded_count > 0 or self.digest_degraded_count > 0
+
+    @property
+    def effective_llm_status(self) -> str:
+        """Status displayed in the header — degraded wins over a stale 'ok'.
+
+        A run whose ``daily_run.llm_status`` says 'ok' but which contains ≥1
+        degraded summary must show *degraded* (P1 item 10 — honest report).
+        """
+        if self.has_degraded_llm and self.llm_status in ("ok", None):
+            return "degraded"
+        return self.llm_status or "off"
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -143,6 +170,32 @@ def _importance_sort_key(article: dict[str, Any]) -> tuple[int, str, float]:
     published = article.get("published_at") or ""
     score = float(article.get("relevance_score") or 0.0)
     return (rank, published, -score)
+
+
+GOOGLE_TRANSLATE_URL = "https://translate.google.com/translate"
+
+
+def google_translate_url(url: str | None, language: str | None, target: str = "fr") -> str | None:
+    """Google Translate page-proxy link for a non-French article, else ``None``.
+
+    No link for French articles, unknown languages, or PDFs (Google's page
+    translation does not handle them - HKEX PDFs are fetched in English anyway).
+    """
+    if not url or not language:
+        return None
+    if language.lower().split("-")[0] == target:
+        return None
+    if url.lower().split("?", 1)[0].endswith(".pdf"):
+        return None
+    from urllib.parse import quote
+
+    return f"{GOOGLE_TRANSLATE_URL}?sl=auto&tl={target}&hl={target}&u={quote(url, safe='')}"
+
+
+def _translate_md(url: str | None, language: str | None) -> str:
+    """`` · [FR](...)`` suffix for Markdown cells, or an empty string."""
+    link = google_translate_url(url, language)
+    return f" · [FR]({link})" if link else ""
 
 
 def _short_link_md(short_code: str, url: str | None) -> str:
@@ -202,6 +255,15 @@ class ReportGenerator:
         md_text = self._render_markdown(ctx)
         json_obj = self._render_json(ctx)
 
+        if not ctx.articles:
+            md_text += (
+                "\n---\n\n> ⚠ **Aucun article collecté.** La fenêtre de collection n'a "
+                "produit aucun article : sources bloquées par robots.txt, pages "
+                "interstitielles (consentement/JS) filtrées, ou clé d'API manquante "
+                "sur une source active. Vérifiez `conf/config.toml`, `.env` et les "
+                "logs (`invest-watch run -v`).\n"
+            )
+
         self._cfg.reports_dir.mkdir(parents=True, exist_ok=True)
         md_path = self._cfg.reports_dir / f"{ctx.run_date}.md"
         json_path = self._cfg.reports_dir / f"{ctx.run_date}.json"
@@ -242,7 +304,7 @@ class ReportGenerator:
         ctx.articles = [
             dict(r)
             for r in self._db.query(
-                "SELECT a.id, a.short_code, a.title, a.url_original, a.published_at,"
+                "SELECT a.id, a.short_code, COALESCE(a.title_fr, a.title) AS title, a.url_original, a.published_at,"
                 "       a.language, a.relevance_score, a.importance_level,"
                 "       a.requires_human_check, a.status,"
                 "       GROUP_CONCAT(DISTINCT c.name)    AS company_names,"
@@ -330,6 +392,22 @@ class ReportGenerator:
         ):
             ctx.short_links[row["short_code"]] = row["url_original"]
 
+        # ── P1 item 10 — honest LLM counters ─────────────────────────────
+        used = 0
+        degraded = 0
+        for summary in ctx.article_summaries.values():
+            if summary.get("llm_used"):
+                used += 1
+            else:
+                degraded += 1
+        ctx.llm_used_count = used
+        ctx.llm_degraded_count = degraded
+        ctx.digest_degraded_count = sum(
+            1 for d in [*ctx.company_digests, *ctx.market_digests]
+            if not d.get("llm_used")
+        )
+        ctx.top_failing_hosts = _top_failing_hosts(ctx.processing_errors)
+
         return ctx
 
     # ── Markdown renderer ─────────────────────────────────────────────────
@@ -342,7 +420,21 @@ class ReportGenerator:
         parts.append(
             f"**Period covered**: {_period_display(ctx.period_start, ctx.period_end, self._cfg.timezone_name)}"
         )
-        parts.append(_llm_status_line(ctx.llm_status, self._cfg.model_id, self._cfg.prompt_version))
+        # P1 item 10 — the LLM line must say *degraded* when ≥1 summary was
+        # degraded, even if daily_run.llm_status still says 'ok'.
+        parts.append(_llm_status_line(ctx.effective_llm_status, self._cfg.model_id, self._cfg.prompt_version))
+        if ctx.total_summaries:
+            parts.append(
+                f"**LLM usage**: {ctx.llm_used_count}/{ctx.total_summaries} summaries via watsonx.ai"
+                f" · {ctx.llm_degraded_count} degraded (llm_used=0)"
+                + (f" · {ctx.digest_degraded_count} degraded digest(s)" if ctx.digest_degraded_count else "")
+            )
+        if ctx.llm_degraded_count > 0 or ctx.digest_degraded_count > 0:
+            parts.append(
+                f"> ⚠ {ctx.llm_degraded_count + ctx.digest_degraded_count} degraded output(s) —"
+                f" retry with `invest-watch report --retry-degraded` (or"
+                f" `invest-watch run --resume {ctx.run_id} --retry-degraded`)."
+            )
         duration = _duration_str(ctx.started_at, ctx.finished_at)
         error_label = f"{ctx.error_count} minor error{'s' if ctx.error_count != 1 else ''}" if ctx.error_count else "no errors"
         parts.append(f"**Execution**: run #{ctx.run_id} · {ctx.status} · {duration} · {error_label}")
@@ -370,10 +462,11 @@ class ReportGenerator:
                 impact_str = _extract_impact(summary)
                 sc = a["short_code"]
                 url = a.get("url_original") or ctx.short_links.get(sc, "")
-                link = _short_link_md(sc, url)
-                check = "✔" if a.get("requires_human_check") else ""
-                company = _company_label(a)
-                parts.append(f"| {company} | {a['title']} | {impact_str} | {link} | {check} |")
+                link = _short_link_md(sc, url) + _translate_md(url, a.get("language"))
+                check = "✔" if a.get("requires_human_check") else "—"
+                company = _md_cell(_company_label(a))
+                title = _md_cell(a["title"])
+                parts.append(f"| {company} | {title} | {impact_str} | {link} | {check} |")
         else:
             parts.append("*(No critical information for this run.)*")
         parts.append("")
@@ -408,13 +501,13 @@ class ReportGenerator:
                 link = _short_link_md(sc, url)
                 date_str = (a.get("published_at") or "")[:10]
                 score = f"{float(a.get('relevance_score') or 0):.2f}"
-                company = _company_label(a)
-                market = _market_label(a)
-                cat = _category_label(a)
-                title_short = (a["title"] or "")[:80]
-                source = a.get("source_name") or "—"
+                company = _md_cell(_company_label(a))
+                market = _md_cell(_market_label(a))
+                cat = _md_cell(_category_label(a))
+                title_short = _md_cell((a["title"] or "")[:80])
+                source = _md_cell(a.get("source_name") or "—")
                 parts.append(
-                    f"| {sc} | {date_str} | {company} | {market} | {cat} | {score} | {title_short} | [{source}]({url}) |"
+                    f"| {sc} | {date_str} | {company} | {market} | {cat} | {score} | {title_short} | [{source}]({url}){_translate_md(url, a.get('language'))} |"
                 )
         else:
             parts.append("*(No articles for this run.)*")
@@ -449,7 +542,11 @@ class ReportGenerator:
             for err in ctx.processing_errors:
                 src = err.get("source_name") or err.get("step") or "unknown"
                 msg = err.get("message") or err.get("error_type") or ""
-                parts.append(f"- {src}: {msg}")
+                parts.append(f"- [{err.get('error_type') or 'unknown'}] {src}: {msg}")
+            if ctx.top_failing_hosts:
+                hosts_str = ", ".join(f"{h} ({n})" for h, n in ctx.top_failing_hosts)
+                parts.append("")
+                parts.append(f"**Top failing hosts**: {hosts_str}")
         else:
             parts.append("*(No errors recorded for this run.)*")
         parts.append("")
@@ -488,6 +585,7 @@ class ReportGenerator:
                 "article_id": int(a["id"]),
                 "title": a.get("title"),
                 "url": a.get("url_original"),
+                "translate_url": google_translate_url(a.get("url_original"), a.get("language")),
                 "published_at": a.get("published_at"),
                 "source": a.get("source_name"),
                 "company": _company_label(a),
@@ -534,8 +632,14 @@ class ReportGenerator:
             "period_start": ctx.period_start,
             "period_end": ctx.period_end,
             "status": ctx.status,
-            "llm_status": ctx.llm_status,
+            "llm_status": ctx.effective_llm_status,
             "error_count": ctx.error_count,
+            "llm_used_count": ctx.llm_used_count,
+            "llm_degraded_count": ctx.llm_degraded_count,
+            "digest_degraded_count": ctx.digest_degraded_count,
+            "top_failing_hosts": [
+                {"host": host, "count": n} for host, n in ctx.top_failing_hosts
+            ],
             "generated_at": utc_now_iso(),
             "global_summary": ctx.global_digest["content"] if ctx.global_digest else None,
             "articles": articles_json,
@@ -557,10 +661,60 @@ class ReportGenerator:
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
+def _md_cell(text: Any) -> str:
+    """Escape a string for a Markdown table cell — ``|`` would break the column.
+
+    P1 item 10: a title like ``Access denied | publisher used Cloudflare``
+    used to shift every following cell of the critical table.
+    """
+    return str(text or "").replace("|", "\\|").replace("\n", " ").strip()
+
+
+def _host_of_message(message: str | None) -> str | None:
+    """Extract the hostname from an error message when it holds a URL.
+
+    Collector fetch errors store the URL as ``message`` (P1 item 7), so the
+    per-host aggregation can group ``http_403`` failures per publisher.
+    """
+    raw = (message or "").strip()
+    for candidate in raw.split():
+        if candidate.startswith(("http://", "https://")):
+            host = urlsplit(candidate).netloc.lower()
+            if host:
+                return host
+    return None
+
+
+def _top_failing_hosts(
+    processing_errors: list[dict[str, Any]],
+    top_n: int = 5,
+) -> list[tuple[str, int]]:
+    """Group unresolved errors by host and return the worst hosts first."""
+    counts: dict[str, int] = {}
+    for err in processing_errors:
+        host = _host_of_message(err.get("message"))
+        if host is None:
+            continue
+        counts[host] = counts.get(host, 0) + 1
+    ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    return ordered[:top_n]
+
+
 def _extract_impact(summary: dict[str, Any] | None) -> str:
-    """Extract a concise impact string from the article summary JSON payload."""
+    """Extract a concise impact string from the article summary JSON payload.
+
+    P1 item 10 — degraded summaries (``llm_used=0``) carry a heuristic
+    payload without a trustworthy consequence block: they display ``—``
+    instead of an empty or misleading ``unknown`` cell.
+    """
     if not summary or not summary.get("json_payload"):
         return "—"
+    if "llm_used" in summary and not summary.get("llm_used"):
+        # Degraded heuristic summary (P1 item 10) — no honest impact can be
+        # claimed: an explicit marker beats an empty or invented cell.  Only
+        # explicit ``llm_used=0`` rows are flagged; callers that omit the key
+        # keep the plain ``—`` placeholder.
+        return "— (dégradé)"
     try:
         payload = json.loads(summary["json_payload"])
     except (json.JSONDecodeError, TypeError):
@@ -569,10 +723,10 @@ def _extract_impact(summary: dict[str, Any] | None) -> str:
     if not cons:
         return "—"
     first = cons[0]
-    impact = first.get("impact", "?")
-    horizon = first.get("horizon", "?")
-    conf = first.get("confidence", "?")
-    return f"{impact} ({horizon}), conf. {conf}"
+    impact = first.get("impact") or "—"
+    horizon = first.get("horizon") or "—"
+    conf = first.get("confidence") or "—"
+    return _md_cell(f"{impact} ({horizon}), conf. {conf}")
 
 
 def _atomic_write(path: Path, text: str, *, encoding: str = "utf-8") -> None:

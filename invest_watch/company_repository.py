@@ -7,6 +7,7 @@ All SQL goes through the shared :class:`~invest_watch.db_manager.DatabaseManager
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass, replace
 from typing import Iterable
@@ -15,6 +16,22 @@ from .db_manager import DatabaseManager, translate_integrity_error, utc_now_iso
 from .exceptions import DuplicateEntityError, NotFoundError, RepositoryError
 
 MAX_COMPANIES = 50  # ENF-10: controlled volume
+
+
+def _json_list(values) -> str | None:
+    """Serialise a keyword list for the v010 JSON TEXT columns (None when empty)."""
+    values = [str(v) for v in (values or ()) if str(v).strip()]
+    return json.dumps(values, ensure_ascii=False) if values else None
+
+
+def _json_tuple(raw) -> tuple[str, ...]:
+    if not raw:
+        return ()
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return ()
+    return tuple(str(v) for v in data) if isinstance(data, list) else ()
 
 _UPDATABLE = frozenset(
     {
@@ -27,6 +44,12 @@ _UPDATABLE = frozenset(
         "website",
         "primary_market_id",
         "summary",
+        "finnhub_symbol",
+        "brave_query",
+        "hkex_stock_id",
+        "topic_keywords",
+        "peers",
+        "topic_query",
         "active",
     }
 )
@@ -35,7 +58,15 @@ _UNIQUE_COLUMNS = ("name", "isin")
 
 @dataclass
 class Company:
-    """One tracked company (specs §9.1 ``company``)."""
+    """One tracked company (specs §9.1 ``company``).
+
+    ``ticker`` is the *listing* ticker (display, searches, dedup); ``finnhub_symbol``
+    is the curated Finnhub API symbol (``AIQUY``, ``SPCX``, ``03750.HK``…).  The
+    two differ whenever the primary listing is not served by Finnhub: Air
+    Liquide trades as ``AI`` on Euronext but only ``AIQUY`` carries news on the
+    API (``AI`` is C3.ai's ticker).  NULL ``finnhub_symbol`` means "not covered"
+    — the engine skips the company instead of querying free text.
+    """
 
     name: str
     legal_name: str | None = None
@@ -46,6 +77,12 @@ class Company:
     website: str | None = None
     primary_market_id: int | None = None
     summary: str | None = None
+    finnhub_symbol: str | None = None
+    brave_query: str | None = None  # v006: overrides the primary Brave query
+    hkex_stock_id: str | None = None  # v007: HKEXnews internal stockId
+    topic_keywords: tuple[str, ...] = ()  # v010: thematic keywords (sector links)
+    peers: tuple[str, ...] = ()  # v010: competitors / partners (peer links)
+    topic_query: str | None = None  # v011: extra Brave sector query
     active: bool = True
     id: int | None = None
     created_at: str | None = None
@@ -77,6 +114,9 @@ class CompanyRepository:
 
     @staticmethod
     def _from_row(row: sqlite3.Row) -> Company:
+        # ``finnhub_symbol`` was added in v005: tolerate a pre-migration row set
+        # so repositories stay usable on an un-migrated database.
+        keys = row.keys()
         return Company(
             name=row["name"],
             legal_name=row["legal_name"],
@@ -87,6 +127,12 @@ class CompanyRepository:
             website=row["website"],
             primary_market_id=row["primary_market_id"],
             summary=row["summary"],
+            finnhub_symbol=row["finnhub_symbol"] if "finnhub_symbol" in keys else None,
+            brave_query=row["brave_query"] if "brave_query" in keys else None,
+            hkex_stock_id=row["hkex_stock_id"] if "hkex_stock_id" in keys else None,
+            topic_keywords=_json_tuple(row["topic_keywords"]) if "topic_keywords" in keys else (),
+            peers=_json_tuple(row["peers"]) if "peers" in keys else (),
+            topic_query=row["topic_query"] if "topic_query" in keys else None,
             active=bool(row["active"]),
             id=row["id"],
             created_at=row["created_at"],
@@ -131,8 +177,9 @@ class CompanyRepository:
             with self.db.transaction():
                 cur = self.db.execute(
                     "INSERT INTO company (name, legal_name, ticker, isin, country_code,"
-                    " currency, website, primary_market_id, summary, active, created_at,"
-                    " updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    " currency, website, primary_market_id, summary, finnhub_symbol,"
+                    " brave_query, hkex_stock_id, topic_keywords, peers, topic_query, active, created_at, updated_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         company.name.strip(),
                         company.legal_name,
@@ -143,6 +190,12 @@ class CompanyRepository:
                         company.website,
                         company.primary_market_id,
                         company.summary,
+                        company.finnhub_symbol,
+                        company.brave_query,
+                        company.hkex_stock_id,
+                        _json_list(company.topic_keywords),
+                        _json_list(company.peers),
+                        company.topic_query,
                         int(bool(company.active)),
                         now,
                         now,
@@ -222,6 +275,9 @@ class CompanyRepository:
             raise RepositoryError("no fields provided for company update")
         if "active" in fields:
             fields = {**fields, "active": int(bool(fields["active"]))}
+        for key in ("topic_keywords", "peers"):
+            if key in fields and not isinstance(fields[key], str) and fields[key] is not None:
+                fields = {**fields, key: _json_list(fields[key])}
         sets = ", ".join(f"{column} = ?" for column in fields)
         params = [*fields.values(), utc_now_iso(), company_id]
         try:

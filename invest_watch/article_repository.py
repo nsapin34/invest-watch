@@ -139,6 +139,8 @@ class ArticleRepository:
         excerpt: str | None = None,
         content_hash: str | None = None,
         word_count: int | None = None,
+        title_fr: str | None = None,
+        content_fr: str | None = None,
     ) -> Article | None:
         """Idempotent insert. Returns ``None`` when the URL already exists."""
         url_original = url.strip()
@@ -153,8 +155,8 @@ class ArticleRepository:
                     "INSERT INTO article (run_id, source_id, guid, url_original, url_normalized,"
                     " title, author, language, published_at, date_certaine, collected_at, content,"
                     " excerpt, content_hash, title_hash, short_code, status, word_count,"
-                    " first_seen_run_id, created_at, updated_at)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    " first_seen_run_id, created_at, updated_at, title_fr, content_fr)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         run_id,
                         source_id,
@@ -177,6 +179,8 @@ class ArticleRepository:
                         run_id,
                         now,
                         now,
+                        title_fr,
+                        content_fr,
                     ),
                 )
                 article_id = int(cur.lastrowid)
@@ -185,9 +189,11 @@ class ArticleRepository:
                     " VALUES (?, ?, ?, ?)",
                     (
                         article_id,
-                        title.strip() if title else "",
+                        # Original + French translation (v008): Chinese articles
+                        # become searchable with French keywords.
+                        " ".join(p for p in ((title or "").strip(), title_fr or "") if p),
                         excerpt or "",
-                        content or "",
+                        "\n".join(p for p in (content or "", content_fr or "") if p),
                     ),
                 )
         except sqlite3.IntegrityError:

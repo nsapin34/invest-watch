@@ -306,6 +306,19 @@ class TestExtractImpact:
         summary = {"json_payload": json.dumps({"consequences_potentielles": []})}
         assert _extract_impact(summary) == "—"
 
+    def test_degraded_summary_is_flagged(self):
+        """P1 item 10 — llm_used=0 rows are marked, never shown as a real impact."""
+        summary = {
+            "llm_used": 0,
+            "json_payload": json.dumps({
+                "consequences_potentielles": [
+                    {"cible": "BYD", "impact": "positive", "horizon": "court",
+                     "confidence": "haute"}
+                ]
+            }),
+        }
+        assert _extract_impact(summary) == "— (dégradé)"
+
     def test_none_summary_returns_dash(self):
         assert _extract_impact(None) == "—"
 
@@ -629,3 +642,25 @@ class TestJsonStructure:
         # read_text should not raise
         content = jpath.read_text(encoding="utf-8")
         json.loads(content)  # must parse cleanly
+
+
+# -- Google Translate link for non-French articles ------------------------------
+
+def test_google_translate_url_for_foreign_article():
+    from invest_watch.report_generator import google_translate_url
+    url = "http://finance.eastmoney.com/a/202610093891519878.html?x=1&y=2"
+    link = google_translate_url(url, "zh")
+    assert link.startswith("https://translate.google.com/translate?sl=auto&tl=fr&hl=fr&u=")
+    assert "http%3A%2F%2Ffinance.eastmoney.com%2Fa%2F202610093891519878.html%3Fx%3D1%26y%3D2" in link
+    assert google_translate_url(url, "en") is not None
+
+
+def test_no_translate_link_for_french_pdf_or_unknown():
+    from invest_watch.report_generator import _translate_md, google_translate_url
+    assert google_translate_url("https://lesechos.fr/a", "fr") is None
+    assert google_translate_url("https://lesechos.fr/a", "fr-FR") is None
+    assert google_translate_url("https://www1.hkexnews.hk/x/2026100800423.pdf", "en") is None
+    assert google_translate_url("https://example.com/a", None) is None
+    assert google_translate_url(None, "zh") is None
+    assert _translate_md("https://lesechos.fr/a", "fr") == ""
+    assert _translate_md("https://example.com/a", "zh").startswith(" \u00b7 [FR](https://translate.google.com/")

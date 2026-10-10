@@ -222,3 +222,38 @@ def test_config_path_is_recorded(project):
     cfg = load_config(project / "conf" / "config.toml")
     assert cfg.config_path == (project / "conf" / "config.toml").resolve()
     assert cfg.project_root == project.resolve()
+
+
+def test_finnhub_symbol_normalised_to_uppercase(project):
+    make_config(project, MINIMAL_CONFIG + '\n[[companies]]\nname = "Hesai"\nfinnhub_symbol = "hsai"\n')
+    cfg = load_config(project / "conf" / "config.toml")
+    assert cfg.companies[0].finnhub_symbol == "HSAI"
+
+
+def test_bare_numeric_ticker_warns_with_qualified_suggestion(project, caplog):
+    import logging
+
+    make_config(
+        project,
+        MINIMAL_CONFIG
+        + '\n[[companies]]\nname = "CATL"\nticker = "3750"\ncountry = "CN"\ncurrency = "HKD"\n',
+    )
+    with caplog.at_level(logging.WARNING, logger="invest_watch.finnhub_symbols"):
+        cfg = load_config(project / "conf" / "config.toml")
+    assert cfg.companies[0].ticker == "3750"
+    assert cfg.companies[0].finnhub_symbol is None
+    assert "03750.HK" in caplog.text
+
+
+def test_bare_numeric_ticker_silent_when_symbol_curated(project, caplog):
+    import logging
+
+    make_config(
+        project,
+        MINIMAL_CONFIG
+        + '\n[[companies]]\nname = "CATL"\nticker = "3750"\nfinnhub_symbol = "03750.HK"\n',
+    )
+    with caplog.at_level(logging.WARNING, logger="invest_watch.finnhub_symbols"):
+        cfg = load_config(project / "conf" / "config.toml")
+    assert cfg.companies[0].finnhub_symbol == "03750.HK"
+    assert "03750.HK" not in caplog.text

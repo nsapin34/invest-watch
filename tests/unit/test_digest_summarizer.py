@@ -16,10 +16,11 @@ Degraded fallbacks
 DigestSummarizer.digest_company
 - LLM enabled + articles → llm_used=True, db_id set, content stored.
 - No articles → placeholder digest, no LLM call.
-- LLM disabled → degraded immediately.
-- circuit-breaker open → degraded immediately.
-- call cap reached → degraded.
-- LLMDegradedError during call → degraded fallback.
+- LLM disabled → degraded immediately (no LLM call, no error row).
+- call cap reached → degraded (no LLM call).
+- LLMDegradedError during call → degraded fallback + processing_error row.
+- A client flagged is_degraded does NOT block the digest loop (per-digest
+  failures are isolated and recorded, not propagated to other digests).
 - Idempotent: second call overwrites, no duplicate row.
 - article_ids in persisted row map to real article ids.
 
@@ -60,6 +61,7 @@ from invest_watch.summarizer import (
     _degraded_global_digest,
     _degraded_market_digest,
     _format_article_block,
+    _sanitise_digest_content,
     build_company_digest_prompt,
     build_global_digest_prompt,
     build_market_digest_prompt,
@@ -438,7 +440,15 @@ class TestDigestCompany:
         assert digest.llm_used is False
         assert stub.call_count == 0
 
-    def test_circuit_breaker_open_degrades(self, db):
+    def test_circuit_breaker_open_does_not_block_digests(self, db):
+        """A stub flagged degraded must NOT poison the remaining digests.
+
+        Regression guard (run #2, 2026-09-15): the real client's
+        ``is_degraded`` mirrors the *transport* circuit-breaker; per-digest
+        failures (truncation, timeout) are recorded per digest but the
+        digest loop keeps trying the following digests. Gating the whole
+        DIGESTS step on one flag turned one bad digest into N degraded ones.
+        """
         run_id = _insert_run(db)
         company_id = _insert_company(db)
         article_id = _insert_article(db, run_id, url_suffix="cb1")
@@ -450,11 +460,18 @@ class TestDigestCompany:
             stub.generate("x")
         except LLMDegradedError:
             pass
+        assert stub.is_degraded is True  # global flag is set…
 
+        # …but the digester still attempts the call (and records the outcome).
         digester = _make_digester(db, stub)
         digest = digester.digest_company(run_id, company_id, "BYD")
 
-        assert digest.llm_used is False
+        assert digest.llm_used is False  # stub(raise_after=0) fails every call
+        rows = db.query(
+            "SELECT error_type FROM processing_error WHERE run_id=? AND step='digest'",
+            (run_id,),
+        )
+        assert [r["error_type"] for r in rows] == ["llm_call_failed"]
 
     def test_call_cap_reached_degrades(self, db):
         run_id = _insert_run(db)
@@ -582,6 +599,26 @@ class TestDigestMarket:
 
         assert digest.llm_used is False
 
+    def test_excludes_company_articles(self, db):
+        """When exclude_article_ids contains the only article, the digest is a
+        placeholder (no LLM call, empty article_ids)."""
+        run_id = _insert_run(db)
+        market_id = _insert_market(db)
+        article_id = _insert_article(db, run_id, url_suffix="excl1")
+        _link_market(db, article_id, market_id)
+        _insert_article_summary(db, run_id, article_id)
+
+        stub = LLMStub(responses=["## EV\n..."])
+        digester = _make_digester(db, stub)
+        digest = digester.digest_market(
+            run_id, market_id, "Electric Vehicles",
+            exclude_article_ids=frozenset({article_id}),
+        )
+
+        assert digest.llm_used is False
+        assert stub.call_count == 0
+        assert digest.article_ids == []
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Tests: DigestSummarizer.digest_global
@@ -664,6 +701,9 @@ class TestDigestGlobal:
 
 class TestDigestRun:
     def test_returns_three_level_tuple(self, db):
+        # Article linked to both a company and a market.
+        # After deduplication, the market digest receives 0 articles (company takes
+        # priority), so the LLM is only called for the company and global digests.
         run_id = _insert_run(db)
         company_id = _insert_company(db)
         market_id = _insert_market(db)
@@ -672,12 +712,16 @@ class TestDigestRun:
         _link_market(db, a1, market_id)
         _insert_article_summary(db, run_id, a1)
 
-        stub = LLMStub(responses=["## BYD\n...", "## EV\n...", "## Global\n..."])
+        stub = LLMStub(responses=["## BYD\n...", "## Global\n..."])
         digester = _make_digester(db, stub)
         company_d, market_d, global_d = digester.digest_run(run_id, run_date="2026-09-08")
 
         assert len(company_d) == 1
+        # Market digest is produced but with no articles (placeholder, llm_used=False)
+        # because the only article was already covered by the company digest.
         assert len(market_d) == 1
+        assert market_d[0].llm_used is False
+        assert market_d[0].article_ids == []
         assert global_d.digest_type == "global"
 
     def test_run_date_fetched_from_db_when_none(self, db):
@@ -700,6 +744,60 @@ class TestDigestRun:
 
         # The only article is duplicate → company digest has no articles → placeholder
         assert len(company_d) == 0 or all(len(d.article_ids) == 0 for d in company_d)
+
+    def test_market_digest_excludes_company_articles(self, db):
+        """An article linked to both a company and a market must only appear in the
+        company digest; the market digest must be empty (placeholder)."""
+        run_id = _insert_run(db)
+        company_id = _insert_company(db)
+        market_id = _insert_market(db)
+        article_id = _insert_article(db, run_id, url_suffix="mx1")
+        _link_company(db, article_id, company_id)
+        _link_market(db, article_id, market_id)
+        _insert_article_summary(db, run_id, article_id)
+
+        stub = LLMStub(responses=["## BYD\n...", "## Global\n..."])
+        digester = _make_digester(db, stub)
+        company_d, market_d, _ = digester.digest_run(run_id, run_date="2026-09-08")
+
+        # Company digest received the article.
+        assert len(company_d) == 1
+        assert article_id in company_d[0].article_ids
+
+        # Market digest was excluded → no articles → placeholder (llm_used=False).
+        assert len(market_d) == 1
+        assert article_id not in market_d[0].article_ids
+        assert market_d[0].llm_used is False
+
+    def test_market_keeps_unlinked_articles(self, db):
+        """An article linked only to a market (no company) must still appear in the
+        market digest even when other articles were excluded."""
+        run_id = _insert_run(db)
+        company_id = _insert_company(db)
+        market_id = _insert_market(db)
+
+        # Article 1: linked to company + market → will be excluded from market digest.
+        a_company = _insert_article(db, run_id, url_suffix="mk-co")
+        _link_company(db, a_company, company_id)
+        _link_market(db, a_company, market_id)
+        _insert_article_summary(db, run_id, a_company)
+
+        # Article 2: linked only to market → must appear in market digest.
+        a_market_only = _insert_article(db, run_id, url_suffix="mk-only")
+        _link_market(db, a_market_only, market_id)
+        _insert_article_summary(db, run_id, a_market_only)
+
+        stub = LLMStub(responses=["## BYD\n...", "## EV\n...", "## Global\n..."])
+        digester = _make_digester(db, stub)
+        company_d, market_d, _ = digester.digest_run(run_id, run_date="2026-09-08")
+
+        # Company digest has the company-linked article.
+        assert a_company in company_d[0].article_ids
+
+        # Market digest has only the market-only article.
+        assert len(market_d) == 1
+        assert a_market_only in market_d[0].article_ids
+        assert a_company not in market_d[0].article_ids
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -736,3 +834,155 @@ class TestSharedCallCounter:
 
         assert digest.llm_used is False
         assert counter[0] == 150  # unchanged
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests: digest content hygiene (P0 — run #2 instruction leakage)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestSanitiseDigestContent:
+    LEAK = ' Ne pas utiliser de phrases comme "aujourd\'hui". Les faits doivent être uniques.\n\n'
+
+    def test_strips_leaking_instructions(self):
+        content = self.LEAK + "## BYD\n### Faits rapportés\n- Revenue up. [a1]"
+        cleaned = _sanitise_digest_content(content)
+        assert cleaned.startswith("## BYD")
+        assert "Ne pas utiliser" not in cleaned
+
+    def test_clean_content_untouched(self):
+        content = "## BYD\n### Faits rapportés\n- Revenue up. [a1]"
+        assert _sanitise_digest_content(content) == content
+
+    def test_content_without_heading_untouched(self):
+        content = "texte sans titre de section"
+        assert _sanitise_digest_content(content) == content
+
+    def test_empty_content_untouched(self):
+        assert _sanitise_digest_content("") == ""
+        assert _sanitise_digest_content("   ") == "   "
+
+    def test_h3_heading_also_strips_prefix(self):
+        content = self.LEAK + "### Faits rapportés\n- ok [a1]"
+        cleaned = _sanitise_digest_content(content)
+        assert cleaned.startswith("### Faits")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests: digest LLM failures persist to processing_error (P0 follow-up)
+# Run #2 20:48: 7 truncated digests produced ONLY log lines — llm_status
+# stayed 'ok'. Every digest LLM failure must leave a visible row.
+# ─────────────────────────────────────────────────────────────────────────────
+
+from invest_watch.llm_client import LLMTruncatedError  # noqa: E402
+
+
+class TestDigestLLMErrorPersistence:
+    def test_company_digest_truncation_persists_llm_truncated(self, db):
+        run_id = _insert_run(db)
+        company_id = _insert_company(db)
+        article_id = _insert_article(db, run_id, url_suffix="digerr1")
+        _link_company(db, article_id, company_id)
+        _insert_article_summary(db, run_id, article_id)
+
+        class _TruncStub:
+            is_degraded = False
+
+            def generate(self, prompt: str) -> str:
+                raise LLMTruncatedError(
+                    "LLM output truncated (finish_reason=length) — "
+                    "increase llm.max_new_tokens (current: 3000)"
+                )
+
+        digest = _make_digester(db, _TruncStub()).digest_company(run_id, company_id, "BYD")
+
+        assert digest.llm_used is False
+        assert digest.validation_status == "degraded"
+        rows = db.query(
+            "SELECT step, article_id, error_type FROM processing_error WHERE run_id=?",
+            (run_id,),
+        )
+        assert len(rows) == 1
+        assert rows[0]["step"] == "digest"
+        assert rows[0]["article_id"] is None  # digest aggregates many articles
+        assert rows[0]["error_type"] == "llm_truncated"
+
+    def test_market_digest_transport_failure_persists_llm_call_failed(self, db):
+        run_id = _insert_run(db)
+        market_id = _insert_market(db)
+        article_id = _insert_article(db, run_id, url_suffix="digerr2")
+        _link_market(db, article_id, market_id)
+        _insert_article_summary(db, run_id, article_id)
+
+        stub = LLMStub(raise_after=0)  # every generate() raises LLMDegradedError
+        digest = _make_digester(db, stub).digest_market(run_id, market_id, "EV")
+
+        assert digest.llm_used is False
+        rows = db.query(
+            "SELECT error_type FROM processing_error WHERE run_id=? AND step='digest'",
+            (run_id,),
+        )
+        assert [r["error_type"] for r in rows] == ["llm_call_failed"]
+
+    def test_global_digest_failure_references_global_ref(self, db):
+        run_id = _insert_run(db)
+        stub = LLMStub(raise_after=0)
+        digest = _make_digester(db, stub).digest_global(
+            run_id, run_date="2026-09-08", company_digests=[], market_digests=[]
+        )
+
+        assert digest.llm_used is False
+        rows = db.query(
+            "SELECT error_type, message FROM processing_error"
+            " WHERE run_id=? AND step='digest'",
+            (run_id,),
+        )
+        assert len(rows) == 1
+        assert rows[0]["error_type"] == "llm_call_failed"
+        assert "global" in rows[0]["message"]
+
+    def test_digest_errors_capped_per_run(self, db):
+        run_id = _insert_run(db)
+        stub = LLMStub(raise_after=0)
+        digester = _make_digester(db, stub)
+        for i in range(12):
+            cid = _insert_company(db, name=f"C{i:02d}")
+            aid = _insert_article(db, run_id, url_suffix=f"digcap{i:02d}")
+            _link_company(db, aid, cid)
+            _insert_article_summary(db, run_id, aid)
+            digester.digest_company(run_id, cid, f"C{i:02d}")
+
+        rows = db.query(
+            "SELECT id FROM processing_error WHERE run_id=? AND step='digest'",
+            (run_id,),
+        )
+        assert len(rows) == 10  # _MAX_LLM_ERROR_ROWS_PER_RUN
+
+
+class TestDigestLeakStrippingEndToEnd:
+    def test_company_digest_content_starts_with_heading(self, db):
+        run_id = _insert_run(db)
+        company_id = _insert_company(db)
+        article_id = _insert_article(db, run_id, url_suffix="leak1")
+        _link_company(db, article_id, company_id)
+        _insert_article_summary(db, run_id, article_id)
+
+        leaked = (
+            ' Si un fait est mentionné dans plusieurs articles, ne le citer qu\'une seule fois.\n\n'
+            "## BYD\n### Faits rapportés\n- Revenue up. [a1]"
+        )
+        stub = LLMStub(responses=[leaked])
+        digester = _make_digester(db, stub)
+        digest = digester.digest_company(run_id, company_id, "BYD")
+
+        assert digest.llm_used is True
+        assert digest.validation_status == "ok"
+        assert digest.content.startswith("## BYD")
+        assert "ne le citer qu" not in digest.content
+
+        row = db.query_one(
+            "SELECT content FROM summary WHERE run_id=? AND type='company' AND ref_id=?",
+            (run_id, company_id),
+        )
+        assert row is not None
+        assert row["content"].startswith("## BYD")

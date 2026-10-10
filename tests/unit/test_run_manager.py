@@ -263,11 +263,19 @@ def test_run_property_raises_before_start(mgr):
     ("completed", EXIT_COMPLETED),
     ("partial",   EXIT_PARTIAL),
     ("cancelled", EXIT_PARTIAL),
+    ("degraded",  EXIT_PARTIAL),   # run finished but stored 0 articles
     ("failed",    EXIT_FAILED),
 ])
 def test_runstats_exit_code(status, expected):
     s = RunStats(run_id=1, run_date="2024-01-15", status=status)
     assert s.exit_code() == expected
+
+
+def test_runstats_includes_skipped_junk_counter():
+    s = RunStats(run_id=1, run_date="2024-01-15")
+    s.skipped_junk = 7
+    assert s.as_dict()["skipped_junk"] == 7
+    assert '"skipped_junk": 7' in s.as_json()
 
 
 def test_runstats_as_dict_contains_all_counters():
@@ -311,4 +319,24 @@ def test_migration_v003_idempotent():
     # v003 is already applied; applying again does nothing (version tracked)
     applied = db.apply_migrations()
     assert applied == []
+    db.close()
+
+
+def test_migration_v004_allows_degraded_status():
+    """v004 relaxes the daily_run.status CHECK constraint to accept 'degraded'."""
+    db = DatabaseManager(":memory:")
+    db.apply_migrations()
+    db.execute(
+        "INSERT INTO daily_run (run_date, period_start, period_end, status, "
+        "error_count, created_at) VALUES (?,?,?,?,?,?)",
+        ("2024-01-15", "s", "e", "degraded", 0, "2024-01-15T07:00:00Z"),
+    )
+    row = db.query_one("SELECT status FROM daily_run WHERE run_date = '2024-01-15'")
+    assert row["status"] == "degraded"
+    # Existing statuses keep working after the table rebuild.
+    db.execute(
+        "INSERT INTO daily_run (run_date, period_start, period_end, status, "
+        "error_count, created_at) VALUES (?,?,?,?,?,?)",
+        ("2024-01-16", "s", "e", "completed", 0, "2024-01-16T07:00:00Z"),
+    )
     db.close()

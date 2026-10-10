@@ -27,6 +27,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from dotenv import load_dotenv
 
 from .exceptions import ConfigError
+from .translator import TranslationSection
+from .weekly_config import WeeklySection
+from .finnhub_symbols import normalize_finnhub_symbol, warn_if_bare_ticker
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +37,17 @@ _ENV_HOME_VAR = "INVEST_WATCH_HOME"
 _VAR_PATTERN = re.compile(r"\$\{([A-Z][A-Z0-9_]*)\}")
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 _SOURCE_TYPES = ("rss", "search", "website", "api")
+
+# Finnhub API symbols are exchange tickers, never free text:
+#   AIQUY, SPCX, KSTR, 03750.HK, 300750.SZ, 601899.SS
+# Anything with a space / accent / lowercase word (e.g. "Air Liquide",
+# "SpaceX news") is rejected at load time — such a value used to be sent as
+# `symbol=...` and produced HTTP 403 or an empty result set (run #4).
+# A bare numeric listing ticker (3750, 2899, 3393) is NOT accepted as a
+# symbol either: it only triggers a guiding warning suggesting the qualified
+# form (see finnhub_symbols.suggest_finnhub_symbol) — `ticker` keeps the
+# display value, `finnhub_symbol` carries the qualified API symbol.
+_FINNHUB_SYMBOL_RE = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,14}$")
 
 _DEFAULTS: dict[str, dict[str, Any]] = {
     "app": {
@@ -62,6 +76,12 @@ _DEFAULTS: dict[str, dict[str, Any]] = {
         "respect_robots": True,
         "use_search_engines": True,
         "finnhub_api_key": "",
+        "max_brave_queries_per_run": 23,
+        "blocked_domains": [],
+        "max_errors_persisted": 0,
+        "slow_hosts": ["eastmoney.com"],
+        "slow_host_timeout_seconds": 45,
+        "slow_host_retries": 1,
     },
     "dedup": {
         "title_similarity": 0.85,
@@ -75,6 +95,8 @@ _DEFAULTS: dict[str, dict[str, Any]] = {
         "importance_default": "moyenne",
         "importance_boost_categories": ["regulator", "financial_results"],
         "importance_boost_source_priority": [1, 2],
+        "topic_link_min": 0.45,
+        "peer_min_topic_hits": 2,
     },
     "llm": {
         "enabled": True,
@@ -82,7 +104,8 @@ _DEFAULTS: dict[str, dict[str, Any]] = {
         "endpoint": "https://eu-de.ml.cloud.ibm.com",
         "project_id": "",
         "max_input_chars": 8000,
-        "max_new_tokens": 700,
+        # 3000: article-JSON stops at EOS, digests (≤25 article blocks) need 1200+.
+        "max_new_tokens": 3000,
         "temperature": 0.1,
         "top_p": 0.9,
         "timeout_seconds": 120,
@@ -91,6 +114,25 @@ _DEFAULTS: dict[str, dict[str, Any]] = {
         "max_calls_per_run": 150,
     },
     "logging": {"level": "INFO", "max_bytes": 5_000_000, "backup_count": 5},
+    "weekly": {
+        "use_llm": True,
+        "max_articles_per_company": 25,
+        "max_chars_per_article": 1200,
+        "max_input_chars": 30_000,
+        "quota_direct": 15,
+        "quota_sector": 5,
+        "quota_peer": 5,
+    },
+    "translation": {
+        "enabled": False,
+        "provider": "azure",
+        "target": "fr",
+        "languages": ["zh"],
+        "max_chars_per_run": 60_000,
+        "max_chars_per_article": 10_000,
+        "timeout_seconds": 30,
+        "max_retries": 2,
+    },
 }
 
 @dataclass(frozen=True)
@@ -130,6 +172,19 @@ class CollectSection:
     respect_robots: bool
     use_search_engines: bool
     finnhub_api_key: str = ""
+    # Brave-specific budget cap: companies are served first (pass 1),
+    # markets fill the remainder (pass 2 = max(0, cap - N_companies)).
+    # No manual adjustment needed when adding companies — markets auto-shrink.
+    max_brave_queries_per_run: int = 23
+    # Publisher blacklist: articles whose (final) URL is on one of these
+    # domains - subdomains included - are skipped before storage.
+    blocked_domains: tuple[str, ...] = ()
+    # processing_error rows persisted per run; 0 = unlimited
+    max_errors_persisted: int = 0
+    # Slow publishers (subdomains included): longer page timeout + N retries on timeout
+    slow_hosts: tuple[str, ...] = ("eastmoney.com",)
+    slow_host_timeout_seconds: int = 45
+    slow_host_retries: int = 1
 
 
 @dataclass(frozen=True)
@@ -151,6 +206,10 @@ class ScoringSection:
     importance_default: str
     importance_boost_categories: tuple[str, ...]
     importance_boost_source_priority: tuple[int, ...]
+    # v010: minimum topic score to link an article to a company it does not name
+    topic_link_min: float = 0.45
+    # v010: distinct topic keywords required for a peer (competitor/partner) link
+    peer_min_topic_hits: int = 2
 
 
 @dataclass(frozen=True)
@@ -223,6 +282,14 @@ class CompanySeed:
     currency: str | None = None
     website: str | None = None
     summary: str | None = None
+    finnhub_symbol: str | None = None
+    brave_query: str | None = None
+    hkex_stock_id: str | None = None
+    topic_keywords: tuple[str, ...] | None = None  # v010
+    peers: tuple[str, ...] | None = None  # v010
+    topic_query: str | None = None  # v011: extra Brave sector query
+    # Config keys explicitly set to "" (e.g. finnhub_symbol = ""): cleared in the DB on sync.
+    clear_fields: tuple[str, ...] = ()
     aliases: tuple[str, ...] | None = None
     languages: tuple[str, ...] | None = None
     markets: tuple[CompanyMarketSeed, ...] = ()
@@ -243,6 +310,8 @@ class AppConfig:
     logging: LoggingSection
     sources: tuple[SourceSeed, ...] = ()
     companies: tuple[CompanySeed, ...] = ()
+    translation: TranslationSection = TranslationSection()
+    weekly: WeeklySection = WeeklySection()
 
     @property
     def db_path(self) -> Path:
@@ -366,22 +435,108 @@ def _parse_company_seeds(raw_companies: list[dict[str, Any]]) -> tuple[CompanySe
             if str(m.get("name", "")).strip()
         )
         country = item.get("country", item.get("country_code"))
+        finnhub_key = next(
+            (k for k in ("finnhub_symbol", "finnhub_ticker") if k in item), None
+        )
+        finnhub_symbol: str | None = None
+        if finnhub_key:
+            raw_symbol = str(item.get(finnhub_key) or "").strip()
+            if raw_symbol:
+                normalised = normalize_finnhub_symbol(raw_symbol)
+                if normalised is None or not _FINNHUB_SYMBOL_RE.match(normalised):
+                    raise ConfigError(
+                        f"[[companies]] '{name.strip()}': "
+                        f"'{finnhub_key}' must be an exchange symbol "
+                        f"(e.g. AIQUY, SPCX, 03750.HK) — got {raw_symbol!r}"
+                    )
+                finnhub_symbol = normalised
+        ticker_raw = str(item["ticker"]).strip() if item.get("ticker") else None
+        ticker_value = ticker_raw or None
+        country_value = str(country).strip() if country else None
+        currency_value = str(item["currency"]).strip() if item.get("currency") else None
+        warn_if_bare_ticker(
+            name.strip(),
+            ticker_value,
+            finnhub_symbol,
+            country=country_value,
+            currency=currency_value,
+        )
         seeds.append(
             CompanySeed(
                 name=name.strip(),
                 legal_name=str(item["legal_name"]).strip() if item.get("legal_name") else None,
-                ticker=str(item["ticker"]).strip() if item.get("ticker") else None,
+                ticker=ticker_value,
                 isin=str(item["isin"]).strip() if item.get("isin") else None,
                 country_code=str(country).strip() if country else None,
                 currency=str(item["currency"]).strip() if item.get("currency") else None,
                 website=str(item["website"]).strip() if item.get("website") else None,
                 summary=str(item["summary"]).strip() if item.get("summary") else None,
+                finnhub_symbol=finnhub_symbol,
+                brave_query=str(item["brave_query"]).strip() or None if item.get("brave_query") else None,
+                hkex_stock_id=str(item["hkex_stock_id"]).strip() or None if item.get("hkex_stock_id") else None,
+                topic_keywords=_str_list(item.get("topic_keywords"), "topic_keywords", name),
+                peers=_str_list(item.get("peers"), "peers", name),
+                topic_query=str(item["topic_query"]).strip() or None if item.get("topic_query") else None,
+                clear_fields=tuple(
+                    k for k in ("finnhub_symbol", "brave_query", "hkex_stock_id", "topic_query")
+                    if k in item and not str(item[k] or "").strip()
+                ),
                 aliases=aliases,
                 languages=languages,
                 markets=markets,
             )
         )
     return tuple(seeds)
+
+
+def _str_list(value: Any, key: str, company: str) -> tuple[str, ...] | None:
+    """``[[companies]]`` list of strings (topic_keywords / peers); None when absent."""
+    if value is None:
+        return None
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise ConfigError(f"config.toml [[companies]] {company!r}: {key} must be a list of strings")
+    out: list[str] = []
+    for v in value:
+        v = v.strip()
+        if v and v.casefold() not in {o.casefold() for o in out}:
+            out.append(v)
+    return tuple(out)
+
+
+def _translation_section(raw: dict[str, Any]) -> TranslationSection:
+    """Build ``[translation]`` (secrets come from the environment, never TOML)."""
+    merged = _merge_section("translation", raw or {})
+    langs = merged.get("languages") or []
+    if isinstance(langs, str):
+        langs = [langs]
+    merged["languages"] = tuple(str(l).strip().lower() for l in langs if str(l).strip())
+    if merged["max_chars_per_run"] < 0 or merged["max_chars_per_article"] < 0:
+        raise ConfigError("config.toml [translation]: character limits must be >= 0")
+    return TranslationSection(**merged)
+
+
+def normalize_blocked_domains(values: object) -> tuple[str, ...]:
+    """Normalise ``[collect] blocked_domains`` entries to bare lower-case hosts.
+
+    Accepts ``"fool.com"``, ``"www.fool.com"`` or ``"https://www.fool.com/x"``.
+    """
+    if not values:
+        return ()
+    if isinstance(values, str):
+        values = [values]
+    if not isinstance(values, (list, tuple)):
+        raise ConfigError("[collect] blocked_domains must be a list of domains")
+    out: list[str] = []
+    for raw in values:
+        host = str(raw or "").strip().lower()
+        if "://" in host:
+            host = host.split("://", 1)[1]
+        host = host.split("/", 1)[0].split(":", 1)[0].strip(".")
+        if host.startswith("www."):
+            host = host[4:]
+        if host and host not in out:
+            out.append(host)
+    return tuple(out)
 
 
 def load_config(
@@ -490,11 +645,18 @@ def load_config(
         config_path=path,
         app=AppSection(**app_raw),
         storage=storage,
-        collect=CollectSection(**collect_raw),
+        collect=CollectSection(
+            **{
+                **collect_raw,
+                "blocked_domains": normalize_blocked_domains(collect_raw.get("blocked_domains")),
+            }
+        ),
         dedup=DedupSection(**dedup_raw),
         scoring=ScoringSection(**scoring_raw),
         llm=llm,
         logging=LoggingSection(**logging_raw),
         sources=sources,
         companies=companies,
+        translation=_translation_section(raw.get("translation", {})),
+        weekly=WeeklySection(**_merge_section("weekly", raw.get("weekly", {}) or {})),
     )

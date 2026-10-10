@@ -68,8 +68,17 @@ def seed_from_config(db: DatabaseManager, cfg: AppConfig) -> dict[str, int]:
             "currency": seed.currency,
             "website": seed.website,
             "summary": seed.summary,
+            "finnhub_symbol": seed.finnhub_symbol,
+            "brave_query": seed.brave_query,
+            "hkex_stock_id": seed.hkex_stock_id,
+            "topic_keywords": seed.topic_keywords,
+            "peers": seed.peers,
+            "topic_query": seed.topic_query,
         }
         fields = {key: value for key, value in fields.items() if value is not None}
+        # `finnhub_symbol = ""` in config.toml: explicit removal (absent key = keep DB value).
+        for key in getattr(seed, "clear_fields", ()) or ():
+            fields[key] = None
         if existing is not None:
             if fields:
                 company_repo.update(existing.id, **fields)
@@ -85,6 +94,12 @@ def seed_from_config(db: DatabaseManager, cfg: AppConfig) -> dict[str, int]:
                     currency=seed.currency,
                     website=seed.website,
                     summary=seed.summary,
+                    finnhub_symbol=seed.finnhub_symbol,
+                    brave_query=seed.brave_query,
+                    hkex_stock_id=seed.hkex_stock_id,
+                    topic_keywords=seed.topic_keywords or (),
+                    peers=seed.peers or (),
+                    topic_query=seed.topic_query,
                 )
             )
             company_id = company.id

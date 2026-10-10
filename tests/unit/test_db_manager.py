@@ -16,13 +16,13 @@ def test_no_schema_before_migrations():
 
 
 def test_migrations_apply_fully(db):
-    assert db.schema_version == 3
-    assert db.latest_migration_version() == 3
+    assert db.schema_version == 11
+    assert db.latest_migration_version() == 11
 
 
 def test_migrations_are_idempotent(db):
     assert db.apply_migrations() == []
-    assert db.schema_version == 3
+    assert db.schema_version == 11
 
 
 def test_migrations_up_to_v1(db_v1):
@@ -42,8 +42,19 @@ def test_v1_to_v2_preserves_data(db_v1):
 
     # v1 -> v2 upgrade keeps the data and bumps db_version
     applied = db_v1.apply_migrations()
-    assert applied == ["v002_article_version.sql", "v003_daily_run_checkpoint.sql"]
-    assert db_v1.schema_version == 3
+    assert applied == [
+        "v002_article_version.sql",
+        "v003_daily_run_checkpoint.sql",
+        "v004_daily_run_degraded_status.sql",
+        "v005_company_finnhub_symbol.sql",
+        "v006_company_brave_query.sql",
+        "v007_company_hkex_stock_id.sql",
+        "v008_article_translation.sql",
+        "v009_weekly_summary.sql",
+        "v010_topic_links.sql",
+        "v011_company_topic_query.sql",
+    ]
+    assert db_v1.schema_version == 11
 
     still_there = db_v1.query_one("SELECT id FROM market WHERE id = ?", (market_id,))
     assert still_there is not None
@@ -121,11 +132,13 @@ def test_transaction_commits(db):
 
 
 def test_bad_migration_script_raises_and_preserves_version(db, tmp_path):
-    (tmp_path / "v004_broken.sql").write_text("THIS IS NOT VALID SQL;", encoding="utf-8")
+    """A broken pending migration aborts with its filename and leaves the version."""
+    # v012: the next pending version - v011 now exists as a real migration.
+    (tmp_path / "v012_broken.sql").write_text("THIS IS NOT VALID SQL;", encoding="utf-8")
     db.migrations_dir = tmp_path
-    with pytest.raises(MigrationError, match="v004"):
+    with pytest.raises(MigrationError, match="v012"):
         db.apply_migrations()
-    assert db.schema_version == 3  # version untouched
+    assert db.schema_version == 11  # version untouched
 
 
 def test_missing_migrations_dir_raises(db, tmp_path):

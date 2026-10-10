@@ -1,7 +1,7 @@
 """Integration tests — full Step 2 workflow with mocked sources (specs §15).
 
 Validates the end-to-end collection pipeline:
-  - daily_run row created and finished with correct status
+  - daily_run row is created by the caller (orchestrator) and reused by date
   - articles stored (title, url, language, excerpt, date)
   - no duplicate articles on a second identical run (idempotency)
   - source errors are isolated; other sources still yield candidates
@@ -9,6 +9,11 @@ Validates the end-to-end collection pipeline:
   - articles outside the D-1 window are not stored
   - empty run (no companies, no sources) completes cleanly
   - CLI `invest-watch run` exits 0 and prints summary stats
+
+P1 item 9 — the collector no longer creates nor finishes the ``daily_run`` row:
+the orchestrator owns it and passes ``run_id`` + ``period``.  Each test below
+opens the row the same way the orchestrator does, then hands it to
+``run_collection``.
 """
 
 from __future__ import annotations
@@ -23,6 +28,7 @@ from invest_watch.bootstrap import seed_from_config
 from invest_watch.cli import EXIT_OK, main
 from invest_watch.collector import run_collection
 from invest_watch.company_repository import Company, CompanyRepository
+from invest_watch.date_detector import compute_period
 from invest_watch.fetcher import Fetcher
 from invest_watch.source_repository import Source, SourceRepository
 
@@ -34,6 +40,25 @@ from tests.conftest import make_config
 
 HTML = Path(__file__).resolve().parent.parent / "fixtures" / "html"
 RSS  = Path(__file__).resolve().parent.parent / "fixtures" / "rss"
+
+RUN_DATE = "2026-09-12"
+
+
+def _open_run(db, config, run_date: str = RUN_DATE) -> tuple[int, object]:
+    """Create the ``daily_run`` row the way the orchestrator does (P1 item 9)."""
+    period = compute_period(
+        config.app.timezone,
+        run_date=run_date,
+        tolerance_hours=config.collect.period_tolerance_hours,
+    )
+    run = ArticleRepository(db).create_run(
+        period.run_date.isoformat(),
+        period.start_iso,
+        period.end_iso,
+        trigger="manual",
+        llm_status="off",
+    )
+    return run.id, period
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Shared transport helpers
@@ -74,8 +99,11 @@ def test_workflow_stores_articles_and_finalises_run(db, config):
     CompanyRepository(db).add(Company(name="BYD", ticker="BYDDY", country_code="CN"))
     object.__setattr__(config.collect, "use_search_engines", False)
 
-    stats = run_collection(config, db, run_date="2026-09-12", fetcher=fetcher,
-                           ddg_search=lambda q: [], brave_api_key="")
+    run_id, period = _open_run(db, config)
+    stats = run_collection(
+        config, db, run_id=run_id, period=period, fetcher=fetcher,
+        ddg_search=lambda q: [], brave_api_key="",
+    )
     fetcher.close()
 
     assert stats.status in {"completed", "partial"}
@@ -91,7 +119,10 @@ def test_workflow_stores_articles_and_finalises_run(db, config):
 
     run = ArticleRepository(db).get_run(stats.run_id)
     assert run is not None
-    assert run.status in {"completed", "partial"}
+    # P1 item 9 — the collector no longer finishes the row: the orchestrator
+    # owns the final status (covered end-to-end by the CLI test below).
+    assert run.status == "running"
+    assert run.run_date == RUN_DATE
     assert run.period_start
     assert run.period_end
 
@@ -103,8 +134,11 @@ def test_workflow_article_has_language_and_excerpt(db, config):
     SourceRepository(db).add(Source(name="HKEX", type="rss", url="https://hkex.test/feed.xml"))
     object.__setattr__(config.collect, "use_search_engines", False)
 
-    stats = run_collection(config, db, run_date="2026-09-12", fetcher=fetcher,
-                           ddg_search=lambda q: [], brave_api_key="")
+    run_id, period = _open_run(db, config)
+    stats = run_collection(
+        config, db, run_id=run_id, period=period, fetcher=fetcher,
+        ddg_search=lambda q: [], brave_api_key="",
+    )
     fetcher.close()
 
     articles = ArticleRepository(db).list_for_run(stats.run_id)
@@ -127,10 +161,18 @@ def test_workflow_idempotent_second_run(db, config):
     SourceRepository(db).add(Source(name="NBS", type="rss", url="https://nbs.test/rss.xml"))
     object.__setattr__(config.collect, "use_search_engines", False)
 
-    first = run_collection(config, db, run_date="2026-09-12", fetcher=fetcher,
-                           ddg_search=lambda q: [], brave_api_key="")
-    second = run_collection(config, db, run_date="2026-09-12", fetcher=fetcher,
-                            ddg_search=lambda q: [], brave_api_key="")
+    run_id, period = _open_run(db, config)
+    first = run_collection(
+        config, db, run_id=run_id, period=period, fetcher=fetcher,
+        ddg_search=lambda q: [], brave_api_key="",
+    )
+    # A second run on the same date reuses the same daily_run row (upsert by date)
+    again_id, period = _open_run(db, config)
+    assert again_id == run_id
+    second = run_collection(
+        config, db, run_id=again_id, period=period, fetcher=fetcher,
+        ddg_search=lambda q: [], brave_api_key="",
+    )
     fetcher.close()
 
     assert second.stored == 0, "second run must not insert duplicate articles"
@@ -161,8 +203,11 @@ def test_workflow_dead_source_isolated(db, config):
     repo.add(Source(name="NBS",       type="rss", url="https://nbs.test/rss.xml"))
     object.__setattr__(config.collect, "use_search_engines", False)
 
-    stats = run_collection(config, db, run_date="2026-09-12", fetcher=fetcher,
-                           ddg_search=lambda q: [], brave_api_key="")
+    run_id, period = _open_run(db, config)
+    stats = run_collection(
+        config, db, run_id=run_id, period=period, fetcher=fetcher,
+        ddg_search=lambda q: [], brave_api_key="",
+    )
     fetcher.close()
 
     # run should not crash; at least the NBS article comes through
@@ -171,6 +216,17 @@ def test_workflow_dead_source_isolated(db, config):
     # dead source error_count incremented
     dead = repo.get_by_name("Dead Feed")
     assert dead.error_count >= 1
+
+    # P1 item 7 — the failure is persisted as one structured processing_error row
+    assert stats.errors_persisted >= 1
+    errors = db.query(
+        "SELECT * FROM processing_error WHERE run_id = ?", (stats.run_id,)
+    )
+    assert errors
+    assert errors[0]["step"] == "harvest"
+    assert errors[0]["error_type"] == "http_403"
+    assert errors[0]["message"].startswith("Dead Feed:")
+    assert errors[0]["source_id"] == dead.id
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -186,8 +242,11 @@ def test_workflow_out_of_window_articles_skipped(db, config):
     SourceRepository(db).add(Source(name="HKEX", type="rss", url="https://hkex.test/feed.xml"))
     object.__setattr__(config.collect, "use_search_engines", False)
 
-    stats = run_collection(config, db, run_date="2026-09-12", fetcher=fetcher,
-                           ddg_search=lambda q: [], brave_api_key="")
+    run_id, period = _open_run(db, config)
+    stats = run_collection(
+        config, db, run_id=run_id, period=period, fetcher=fetcher,
+        ddg_search=lambda q: [], brave_api_key="",
+    )
     fetcher.close()
 
     articles = ArticleRepository(db).list_for_run(stats.run_id)
@@ -216,8 +275,11 @@ def test_workflow_robots_disallowed_skipped(db, config):
     SourceRepository(db).add(Source(name="HKEX", type="rss", url="https://hkex.test/feed.xml"))
     object.__setattr__(config.collect, "use_search_engines", False)
 
-    stats = run_collection(config, db, run_date="2026-09-12", fetcher=fetcher,
-                           ddg_search=lambda q: [], brave_api_key="")
+    run_id, period = _open_run(db, config)
+    stats = run_collection(
+        config, db, run_id=run_id, period=period, fetcher=fetcher,
+        ddg_search=lambda q: [], brave_api_key="",
+    )
     fetcher.close()
 
     # All pages disallowed → nothing stored, robots counter incremented
@@ -234,8 +296,11 @@ def test_workflow_empty_run_completes(db, config):
     object.__setattr__(config.collect, "use_search_engines", False)
     fetcher = _make_fetcher(lambda req: httpx.Response(200, content=b""))
 
-    stats = run_collection(config, db, run_date="2026-09-12", fetcher=fetcher,
-                           ddg_search=lambda q: [], brave_api_key="")
+    run_id, period = _open_run(db, config)
+    stats = run_collection(
+        config, db, run_id=run_id, period=period, fetcher=fetcher,
+        ddg_search=lambda q: [], brave_api_key="",
+    )
     fetcher.close()
 
     assert stats.status == "completed"
@@ -265,8 +330,11 @@ def test_workflow_multiple_sources_all_harvested(db, config):
     repo.add(Source(name="PBoC", type="rss", url="https://pboc.test/rss.xml"))
     object.__setattr__(config.collect, "use_search_engines", False)
 
-    stats = run_collection(config, db, run_date="2026-09-12", fetcher=fetcher,
-                           ddg_search=lambda q: [], brave_api_key="")
+    run_id, period = _open_run(db, config)
+    stats = run_collection(
+        config, db, run_id=run_id, period=period, fetcher=fetcher,
+        ddg_search=lambda q: [], brave_api_key="",
+    )
     fetcher.close()
 
     # Each fixture has 1 current item → at least 3 stored (the hkex old one is filtered)
@@ -285,8 +353,11 @@ def test_workflow_paywall_article_stored_as_metadata(db, config):
     SourceRepository(db).add(Source(name="HKEX", type="rss", url="https://hkex.test/feed.xml"))
     object.__setattr__(config.collect, "use_search_engines", False)
 
-    stats = run_collection(config, db, run_date="2026-09-12", fetcher=fetcher,
-                           ddg_search=lambda q: [], brave_api_key="")
+    run_id, period = _open_run(db, config)
+    stats = run_collection(
+        config, db, run_id=run_id, period=period, fetcher=fetcher,
+        ddg_search=lambda q: [], brave_api_key="",
+    )
     fetcher.close()
 
     articles = ArticleRepository(db).list_for_run(stats.run_id)
@@ -309,8 +380,11 @@ def test_workflow_chinese_article_stored(db, config):
     CompanyRepository(db).add(Company(name="BYD", ticker="BYDDY", country_code="CN"))
     object.__setattr__(config.collect, "use_search_engines", False)
 
-    stats = run_collection(config, db, run_date="2026-09-12", fetcher=fetcher,
-                           ddg_search=lambda q: [], brave_api_key="")
+    run_id, period = _open_run(db, config)
+    stats = run_collection(
+        config, db, run_id=run_id, period=period, fetcher=fetcher,
+        ddg_search=lambda q: [], brave_api_key="",
+    )
     fetcher.close()
 
     articles = ArticleRepository(db).list_for_run(stats.run_id)
@@ -417,13 +491,22 @@ def test_workflow_finnhub_articles_stored(db, config):
         url="https://finnhub.io/api/v1/company-news",
         priority=2,
     ))
-    CompanyRepository(db).add(Company(name="BYD", ticker="BYDDY", country_code="CN"))
+    CompanyRepository(db).add(
+        Company(
+            name="BYD",
+            ticker="BYDDY",
+            country_code="CN",
+            finnhub_symbol="BYDDY",  # curated API symbol — drives the Finnhub call
+        )
+    )
     object.__setattr__(config.collect, "use_search_engines", True)
     object.__setattr__(config.collect, "finnhub_api_key", "test-key")
 
+    run_id, period = _open_run(db, config)
     stats = run_collection(
         config, db,
-        run_date="2026-09-12",
+        run_id=run_id,
+        period=period,
         fetcher=fetcher,
         ddg_search=lambda q: [],
         brave_api_key="",

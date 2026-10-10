@@ -75,9 +75,15 @@ from .config_manager import AppConfig
 from .date_detector import compute_period
 from .db_manager import DatabaseManager, utc_now_iso
 from .dedup import Deduplicator
+from .doctor import (
+    disabled_engines as preflight_disabled_engines,
+    run_preflight,
+    watsonx_invalid,
+)
 from .exceptions import LockAlreadyAcquiredError
 from .fetcher import Fetcher
 from .lock_manager import acquire_lock, release_lock
+from .source_repository import SourceRepository
 from .stop_flag import check_and_clear_stop_flag
 from .report_generator import ReportConfig, ReportGenerator
 from .run_manager import (
@@ -109,6 +115,8 @@ def run(
     run_date: str | _date | None = None,
     resume_run_id: int | None = None,
     force: bool = False,
+    trigger: str = "manual",
+    retry_degraded: bool = False,
     # Injectable test seams — None means "use the real implementation"
     fetcher: Fetcher | None = None,
     llm_client: Any | None = None,
@@ -129,6 +137,14 @@ def run(
         Steps already completed (checkpoint) are skipped.
     force:
         When True, remove a stale/live ``run.lock`` and proceed anyway.
+    trigger:
+        ``scheduler`` | ``manual`` | ``retry`` — stored in ``daily_run.trigger``
+        (P1 item 9) so the operator can tell a scheduled run from a manual one.
+    retry_degraded:
+        With ``resume_run_id``: re-run SUMMARISE for articles whose summary has
+        ``llm_used=0`` (degraded), regenerate digests + report, and restore an
+        honest ``llm_status`` (P1 item 11).  The run row's trigger becomes
+        ``'retry'``.
     fetcher:
         Injected for tests; ``None`` creates a real :class:`~.fetcher.Fetcher`.
     llm_client:
@@ -151,11 +167,18 @@ def run(
 
     run_mgr = RunManager(db, data_dir, llm_enabled=cfg.llm.enabled)
 
+    # Surface misconfiguration before a run burns its query budget on engines
+    # that will silently degrade (ENF-01): active API/search sources whose key
+    # is missing or still a placeholder.
+    _warn_on_missing_api_keys(cfg)
+
     try:
         return _execute(
             cfg, db, run_mgr, data_dir,
             run_date=run_date,
             resume_run_id=resume_run_id,
+            trigger=trigger,
+            retry_degraded=retry_degraded,
             fetcher=fetcher,
             llm_client=llm_client,
         )
@@ -189,6 +212,8 @@ def _execute(
     *,
     run_date: str | _date | None,
     resume_run_id: int | None,
+    trigger: str,
+    retry_degraded: bool,
     fetcher: Fetcher | None,
     llm_client: Any | None,
 ) -> int:
@@ -206,12 +231,23 @@ def _execute(
     if resume_run_id is not None:
         daily_run = run_mgr.load_existing(resume_run_id)
         run_date_str = daily_run.run_date
+        # The resumed run's date may differ from today: recompute the D-1
+        # window from the ROW's date (the collector no longer computes it).
+        period = compute_period(
+            cfg.app.timezone,
+            run_date=run_date_str,
+            tolerance_hours=cfg.collect.period_tolerance_hours,
+        )
         checkpoint = run_mgr.get_checkpoint()
         logger.info(
             "orchestrator: resuming run #%d (checkpoint=%s)",
             resume_run_id,
             checkpoint.value if checkpoint else "none",
         )
+        if retry_degraded:
+            # A resume with --retry-degraded IS a retry: tag the row so
+            # scheduler/manual/retry stay distinguishable (P1 items 9+11).
+            run_mgr.set_trigger("retry")
     else:
         # Seed config entities (companies, sources) before opening the run.
         seed_from_config(db, cfg)
@@ -219,11 +255,34 @@ def _execute(
             run_date_str,
             period.start_iso,
             period.end_iso,
-            trigger="manual",
+            trigger=trigger,
         )
         checkpoint = None
 
+    # ── Pre-flight doctor (P1 item 8): ping watsonx / Finnhub / Brave ─────
+    # Best-effort and bounded (3 HTTP calls): an invalid key must produce a
+    # clean "clé invalide" skip, not one raw 403 per article/query.
+    preflight_bad_engines: frozenset[str] = frozenset()
+    watsonx_key_invalid = False
+    try:
+        pings = run_preflight(cfg, db=db)
+        for p in pings:
+            (logger.warning if not p.ok else logger.info)(
+                "doctor %s: %s — %s", p.service, p.status, p.message
+            )
+        preflight_bad_engines = preflight_disabled_engines(pings)
+        watsonx_key_invalid = watsonx_invalid(pings)
+    except Exception as exc:  # non-fatal — never block a run on the doctor
+        logger.warning("orchestrator: pre-flight skipped — %s", exc)
+
     todo = steps_to_run(checkpoint)
+    if retry_degraded and resume_run_id is not None:
+        # Force the LLM pipeline back on even if the checkpoint already passed
+        # it: the whole point is to re-summarise the degraded articles, then
+        # rebuild digests and the report from them (P1 item 11).
+        forced = {RunStep.SUMMARISE, RunStep.DIGESTS, RunStep.REPORT}
+        todo = sorted(set(todo) | forced, key=lambda s: s.step_index())
+
     stats = RunStats(
         run_id=run_mgr.run_id,
         run_date=run_date_str,
@@ -257,8 +316,10 @@ def _execute(
             coll_stats = run_collection(
                 cfg,
                 db,
-                run_date=run_date_str,
+                run_id=run_mgr.run_id,
+                period=period,
                 fetcher=effective_fetcher,
+                disabled_engines=preflight_bad_engines,
             )
             stats.queries        = coll_stats.queries
             stats.harvested      = coll_stats.harvested
@@ -266,16 +327,25 @@ def _execute(
             stats.stored         = coll_stats.stored
             stats.skipped_date   = coll_stats.skipped_date
             stats.skipped_robots = coll_stats.skipped_robots
+            stats.skipped_junk   = coll_stats.skipped_junk
             stats.fetch_errors   = coll_stats.fetch_errors
+            stats.errors_persisted = coll_stats.errors_persisted
+            stats.errors_dropped   = coll_stats.errors_dropped
             if coll_stats.errors:
+                # P1 item 7 — CollectionStats.errors merge into RunStats.errors:
+                # the details (URL, host, type) survive inside stats_json.
                 stats.errors.extend(coll_stats.errors)
                 stats.error_count += len(coll_stats.errors)
                 stats.status = "partial"
         except Exception as exc:
-            logger.error("orchestrator: collection failed — %s", exc)
+            logger.exception("orchestrator: collection failed — %s", exc)
             stats.errors.append(f"collection: {exc}")
             stats.error_count += 1
             stats.status = "partial"
+            # P1 item 7 — a crashed collection step must ALSO leave a
+            # processing_error row (previously only logged → `invest-watch
+            # errors` showed nothing).
+            _record_error(db, run_mgr.run_id, RunStep.HARVEST, "run_collection", exc)
         finally:
             if own_fetcher:
                 effective_fetcher.close()
@@ -324,28 +394,75 @@ def _execute(
     if check_and_clear_stop_flag(data_dir):
         return _cancel(run_mgr, stats)
 
+    # Shared LLM client (steps 11 + 13): built at most once per run and shared
+    # by SUMMARISE and DIGESTS so the per-run content-hash cache and the
+    # circuit-breaker state are common to both steps (run #2 of 2026-09-15
+    # built two independent clients, losing cache and breaker continuity).
+    shared_llm: Any | None = None
+
+    def _get_shared_llm() -> Any:
+        nonlocal shared_llm
+        if shared_llm is None:
+            if watsonx_key_invalid:
+                # P1 item 8 — pre-flight proved the key invalid (IAM 401/403):
+                # degrade immediately with an honest reason instead of burning
+                # one raw 403 per article.
+                from .llm_client import DisabledLLMClient
+                shared_llm = DisabledLLMClient(
+                    "clé watsonx invalide (pré-vol: 401/403) — corrigez WATSONX_API_KEY dans .env"
+                )
+            else:
+                shared_llm = _build_llm_client(cfg, llm_client)
+                reset = getattr(shared_llm, "reset_circuit_breaker", None)
+                if callable(reset):
+                    reset()  # spec §8.5: breaker/counter resets at each run start
+        return shared_llm
+
     # ── Step 11: SUMMARISE ─────────────────────────────────────────────────
     # On resume: only articles that have no existing summary row are processed
     # (idempotent — the LLM is never called twice for the same article/run).
+    # With retry_degraded (P1 item 11): articles whose summary has llm_used=0
+    # are re-processed so a fixed key / recovered service repairs the run.
     if RunStep.SUMMARISE in todo:
-        try:
-            llm = _build_llm_client(cfg, llm_client)
-            sum_cfg = summarizer_config_from_section(
-                cfg.llm, relevance_min=cfg.scoring.relevance_min
-            )
-            article_summarizer = ArticleSummarizer(db, llm, sum_cfg)
-            summaries = article_summarizer.summarise_run(
+        if ArticleRepository(db).count_for_run(run_mgr.run_id) == 0:
+            # Nothing stored → a paid LLM call would only re-float an empty run.
+            logger.info(
+                "orchestrator: 0 articles in run #%d — skipping LLM summarisation",
                 run_mgr.run_id,
-                resume=resume_run_id is not None,
             )
-            stats.summarised = len(summaries)
-        except Exception as exc:
-            logger.error("orchestrator: summarise failed — %s", exc)
-            stats.errors.append(f"summarise: {exc}")
-            stats.error_count += 1
-            stats.status = "partial"
-            _record_error(db, run_mgr.run_id, RunStep.SUMMARISE, "summarise_run", exc)
-        run_mgr.set_checkpoint(RunStep.SUMMARISE)
+            run_mgr.set_checkpoint(RunStep.SUMMARISE)
+        else:
+            try:
+                if retry_degraded:
+                    # Previous summarise/digest failures are being re-attempted:
+                    # resolve the stale rows so a fully successful retry is not
+                    # misread as degraded by the llm_status check below.
+                    db.execute(
+                        "UPDATE processing_error SET status = 'resolved', updated_at = ?"
+                        " WHERE run_id = ? AND step IN ('summarise', 'digest')"
+                        "   AND status != 'resolved'",
+                        (utc_now_iso(), run_mgr.run_id),
+                    )
+                llm = _get_shared_llm()
+                sum_cfg = summarizer_config_from_section(
+                    cfg.llm, relevance_min=cfg.scoring.relevance_min
+                )
+                article_summarizer = ArticleSummarizer(db, llm, sum_cfg)
+                summaries = article_summarizer.summarise_run(
+                    run_mgr.run_id,
+                    resume=resume_run_id is not None,
+                    retry_degraded=retry_degraded,
+                )
+                stats.summarised = len(summaries)
+                stats.llm_used = sum(1 for s in summaries if s.llm_used)
+                stats.llm_degraded = len(summaries) - stats.llm_used
+            except Exception as exc:
+                logger.error("orchestrator: summarise failed — %s", exc)
+                stats.errors.append(f"summarise: {exc}")
+                stats.error_count += 1
+                stats.status = "partial"
+                _record_error(db, run_mgr.run_id, RunStep.SUMMARISE, "summarise_run", exc)
+            run_mgr.set_checkpoint(RunStep.SUMMARISE)
 
     if check_and_clear_stop_flag(data_dir):
         return _cancel(run_mgr, stats)
@@ -359,23 +476,75 @@ def _execute(
 
     # ── Step 13: DIGESTS ───────────────────────────────────────────────────
     if RunStep.DIGESTS in todo:
-        try:
-            llm = _build_llm_client(cfg, llm_client)
-            sum_cfg = summarizer_config_from_section(
-                cfg.llm, relevance_min=cfg.scoring.relevance_min
+        if ArticleRepository(db).count_for_run(run_mgr.run_id) == 0:
+            # No articles → nothing to digest (also avoids a second LLM init).
+            logger.info(
+                "orchestrator: 0 articles in run #%d — skipping digests",
+                run_mgr.run_id,
             )
-            digest_summarizer = DigestSummarizer(db, llm, sum_cfg)
-            digest_summarizer.digest_run(run_mgr.run_id, run_date=run_date_str)
-        except Exception as exc:
-            logger.error("orchestrator: digests failed — %s", exc)
-            stats.errors.append(f"digests: {exc}")
-            stats.error_count += 1
-            stats.status = "partial"
-            _record_error(db, run_mgr.run_id, RunStep.DIGESTS, "digest_run", exc)
-        run_mgr.set_checkpoint(RunStep.DIGESTS)
+            run_mgr.set_checkpoint(RunStep.DIGESTS)
+        else:
+            try:
+                llm = _get_shared_llm()
+                sum_cfg = summarizer_config_from_section(
+                    cfg.llm, relevance_min=cfg.scoring.relevance_min
+                )
+                digest_summarizer = DigestSummarizer(db, llm, sum_cfg)
+                digest_summarizer.digest_run(run_mgr.run_id, run_date=run_date_str)
+            except Exception as exc:
+                logger.error("orchestrator: digests failed — %s", exc)
+                stats.errors.append(f"digests: {exc}")
+                stats.error_count += 1
+                stats.status = "partial"
+                _record_error(db, run_mgr.run_id, RunStep.DIGESTS, "digest_run", exc)
+            run_mgr.set_checkpoint(RunStep.DIGESTS)
 
     if check_and_clear_stop_flag(data_dir):
         return _cancel(run_mgr, stats)
+
+    # ── llm_status honesty: circuit OR persisted LLM failures degrade it ──
+    # The breaker alone does not cover digest truncations (LLMTruncatedError
+    # deliberately does NOT trip the circuit): if unresolved 'digest'/'summarise'
+    # errors were persisted for this run, the report must show ⚠ degraded, not ✔.
+    # Resolved rows (a successful --retry-degraded) no longer count — P1 item 11.
+    degraded = bool(getattr(shared_llm, "is_degraded", False)) if shared_llm is not None else False
+    if not degraded and shared_llm is not None:
+        try:
+            row = db.query_one(
+                "SELECT COUNT(*) AS n FROM processing_error"
+                " WHERE run_id = ? AND step IN ('summarise', 'digest')"
+                "   AND status != 'resolved'",
+                (run_mgr.run_id,),
+            )
+            degraded = bool(row and int(row["n"]) > 0)
+        except Exception as exc:  # non-fatal — status best-effort
+            logger.warning("orchestrator: could not check processing_error — %s", exc)
+    if degraded:
+        try:
+            db.execute(
+                "UPDATE daily_run SET llm_status = 'degraded' WHERE id = ?",
+                (run_mgr.run_id,),
+            )
+        except Exception as exc:  # non-fatal — status best-effort
+            logger.warning("orchestrator: could not set llm_status=degraded — %s", exc)
+    elif cfg.llm.enabled:
+        # A fully successful retry restores an honest 'ok' (P1 item 11):
+        # a run previously marked degraded is repaired without a manual SQL fix.
+        try:
+            row = db.query_one(
+                "SELECT llm_status FROM daily_run WHERE id = ?", (run_mgr.run_id,)
+            )
+            if row and row["llm_status"] == "degraded":
+                db.execute(
+                    "UPDATE daily_run SET llm_status = 'ok' WHERE id = ?",
+                    (run_mgr.run_id,),
+                )
+                logger.info(
+                    "orchestrator: run #%d llm_status restored to 'ok' (no unresolved LLM errors)",
+                    run_mgr.run_id,
+                )
+        except Exception as exc:  # non-fatal — status best-effort
+            logger.warning("orchestrator: could not restore llm_status — %s", exc)
 
     # ── Step 14: REPORT ────────────────────────────────────────────────────
     if RunStep.REPORT in todo:
@@ -404,7 +573,26 @@ def _execute(
 
     # ── Finalise ───────────────────────────────────────────────────────────
     if stats.status == "running":
-        stats.status = "completed"
+        if stats.stored == 0:
+            if not SourceRepository(db).list(include_inactive=False):
+                # Fresh/empty setup: nothing is configured to collect, so an
+                # article-free run is legitimate (ENF-01 — the app never stops).
+                stats.status = "completed"
+            else:
+                # Sources ARE configured but yielded nothing — flag the run so
+                # the operator sees it instead of a green "completed" empty run.
+                stats.status = "degraded"
+                logger.warning(
+                    "orchestrator: run #%d stored 0 articles (harvested=%d, skipped_robots=%d, "
+                    "skipped_junk=%d, fetch_errors=%d) — marked degraded; check sources/API keys",
+                    run_mgr.run_id,
+                    stats.harvested,
+                    stats.skipped_robots,
+                    stats.skipped_junk,
+                    stats.fetch_errors,
+                )
+        else:
+            stats.status = "completed"
 
     run_mgr.finish(stats)
 
@@ -456,6 +644,54 @@ def _build_llm_client(cfg: AppConfig, injected: Any | None) -> Any:
         return injected
     from .llm_client import WatsonxLLMClient, llm_client_config_from_section
     return WatsonxLLMClient(llm_client_config_from_section(cfg.llm))
+
+
+_PLACEHOLDER_MARKERS = (
+    "your-",
+    "changeme",
+    "placeholder",
+    "xxx",
+    "<your",
+    "todo",
+)
+
+
+def _is_placeholder_key(value: str) -> bool:
+    lowered = (value or "").lower()
+    return any(marker in lowered for marker in _PLACEHOLDER_MARKERS)
+
+
+def _warn_on_missing_api_keys(cfg: AppConfig) -> None:
+    """Warn at run start when an active API/search source can't authenticate.
+
+    Only honest-seeming keys silence the warning: empty, unset or clearly
+    placeholder values (``your-...``, ``changeme``, ...) are flagged so a
+    misconfigured run is caught before it harvests nothing.
+    """
+    import os
+
+    active = [s for s in cfg.sources if s.active]
+    finnhub_sources = [s for s in active if s.type == "api" and "finnhub" in s.name.lower()]
+    brave_sources = [s for s in active if s.type == "search" and "brave" in s.name.lower()]
+
+    if finnhub_sources:
+        key = os.environ.get("FINNHUB_API_KEY", "")
+        if not key or _is_placeholder_key(key):
+            logger.warning(
+                "%s is active but FINNHUB_API_KEY is %s — Finnhub will be skipped "
+                "(degraded). Put a real key in .env.",
+                ", ".join(s.name for s in finnhub_sources),
+                "missing" if not key else "a placeholder",
+            )
+    if brave_sources:
+        key = os.environ.get("BRAVE_API_KEY", "")
+        if not key or _is_placeholder_key(key):
+            logger.warning(
+                "%s is active but BRAVE_API_KEY is %s — Brave Search will be skipped "
+                "(degraded). Put a real key in .env.",
+                ", ".join(s.name for s in brave_sources),
+                "missing" if not key else "a placeholder",
+            )
 
 
 def _record_error(
@@ -528,8 +764,11 @@ def _vacuum_backup(db: DatabaseManager, cfg: AppConfig) -> None:
     try:
         backup_dir = cfg.storage.backups_dir
         backup_dir.mkdir(parents=True, exist_ok=True)
-        run_date = utc_now_iso()[:10]  # YYYY-MM-DD
-        backup_path = backup_dir / f"invest-{run_date}.db"
+        # Timestamped name so repeated same-day runs never collide (VACUUM INTO
+        # refuses to overwrite an existing file) and every run keeps its backup.
+        now_utc = utc_now_iso()  # 2026-09-13T12:03:30Z
+        stamp = f"{now_utc[:10]}-{now_utc[11:19].replace(':', '')}"
+        backup_path = backup_dir / f"invest-{stamp}.db"
         # VACUUM INTO makes a clean, compacted copy — no WAL, no locks.
         db.execute(f"VACUUM INTO '{backup_path}'")
         logger.info("backup written: %s", backup_path)

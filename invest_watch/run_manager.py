@@ -100,6 +100,7 @@ class RunStats:
     stored: int = 0
     skipped_date: int = 0
     skipped_robots: int = 0
+    skipped_junk: int = 0
     fetch_errors: int = 0
 
     # processing counters
@@ -107,11 +108,24 @@ class RunStats:
     classified: int = 0
     summarised: int = 0
 
+    # LLM counters (P1 item 10 — honest reporting of degraded summaries)
+    llm_used: int = 0
+    llm_degraded: int = 0
+
     # error tracking
     error_count: int = 0
     errors: list[str] = field(default_factory=list)
+    # P1 item 7 — processing_error persistence bookkeeping (collector cap):
+    errors_persisted: int = 0
+    errors_dropped: int = 0
+
+    _MAX_ERRORS_IN_STATS = 50
 
     def as_dict(self) -> dict:
+        # The first N error strings are persisted in stats_json so the run
+        # keeps the *details* (URL, host, type) even after processing_error
+        # rows are purged or capped (P1 item 7 — fusion of CollectionStats.errors
+        # into RunStats.errors).
         return {
             "queries": self.queries,
             "harvested": self.harvested,
@@ -119,11 +133,17 @@ class RunStats:
             "stored": self.stored,
             "skipped_date": self.skipped_date,
             "skipped_robots": self.skipped_robots,
+            "skipped_junk": self.skipped_junk,
             "fetch_errors": self.fetch_errors,
             "deduped": self.deduped,
             "classified": self.classified,
             "summarised": self.summarised,
+            "llm_used": self.llm_used,
+            "llm_degraded": self.llm_degraded,
             "error_count": self.error_count,
+            "errors_persisted": self.errors_persisted,
+            "errors_dropped": self.errors_dropped,
+            "errors": list(self.errors[: self._MAX_ERRORS_IN_STATS]),
         }
 
     def as_json(self) -> str:
@@ -132,7 +152,9 @@ class RunStats:
     def exit_code(self) -> int:
         if self.status == "completed":
             return EXIT_COMPLETED
-        if self.status in ("partial", "cancelled"):
+        # "degraded" (run finished but stored zero articles) and "partial" /
+        # "cancelled" both warrant a non-zero, non-fatal exit code.
+        if self.status in ("partial", "cancelled", "degraded"):
             return EXIT_PARTIAL
         return EXIT_FAILED
 
@@ -261,6 +283,21 @@ class RunManager:
             stats.status,
             stats.error_count,
         )
+
+    def set_trigger(self, trigger: str) -> None:
+        """Update the ``trigger`` column of the current run row.
+
+        Used when a resumed run is actually a retry
+        (``--resume RUN_ID --retry-degraded`` → trigger ``'retry'`` — P1
+        item 9 keeps scheduler / manual / retry distinguishable in the DB).
+        """
+        self._repo.db.execute(
+            "UPDATE daily_run SET trigger = ? WHERE id = ?",
+            (trigger, self.run_id),
+        )
+        if self._run is not None:
+            self._run.trigger = trigger
+        logger.info("RunManager: run #%d trigger → %s", self.run_id, trigger)
 
     def load_existing(self, run_id: int) -> DailyRun:
         """Load an existing ``daily_run`` row by id (for ``--resume``).

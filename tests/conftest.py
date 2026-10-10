@@ -45,6 +45,8 @@ def clean_env(monkeypatch):
         "INVEST_WATCH_HOME",
         "BRAVE_API_KEY",
         "FINNHUB_API_KEY",
+        "AZURE_TRANSLATOR_KEY",
+        "AZURE_TRANSLATOR_REGION",
     ):
         monkeypatch.delenv(var, raising=False)
 

@@ -103,6 +103,75 @@ def _count_matches(pattern: str, text: str, is_cjk_or_exact: bool = False) -> in
     return len(regex.findall(text))
 
 
+_AMBIGUOUS_TICKER_MAX_LEN = 3
+
+
+def _ticker_patterns(ticker: str) -> list[str]:
+    """Unambiguous contextual forms for a short ticker (e.g. 'AI')."""
+    t = re.escape(ticker)
+    return [
+        rf"\({t}\)",                                      # "(AI)"
+        rf"\b(?:EPA|ENXTPA|PA|Euronext)\s*[:.]\s*{t}\b",  # "EPA:AI"
+        rf"\b{t}\.PA\b",                                  # "AI.PA"
+    ]
+
+
+def _count_ticker(ticker: str, text: str) -> int:
+    """Count ticker mentions; short tickers only in unambiguous contexts.
+
+    Long tickers: whole word, case-sensitive. Short tickers (<= 3 chars, e.g.
+    Air Liquide 'AI') collide with common words, so only contextual forms count.
+    """
+    if not ticker or not text:
+        return 0
+    if len(ticker) > _AMBIGUOUS_TICKER_MAX_LEN:
+        return len(re.findall(rf"\b{re.escape(ticker)}\b", text))
+    return sum(len(re.findall(p, text)) for p in _ticker_patterns(ticker))
+
+
+LINK_TYPES = ("direct", "sector", "peer")
+_TOPIC_WEIGHT = 0.15  # topic score per distinct keyword found
+
+
+_CASE_SENSITIVE_MAX_LEN = 4
+
+
+def _count_term(term: str, text: str) -> int:
+    """Count a topic keyword / peer name, guarding against common-word collisions.
+
+    CJK: substring. Short (<= 4 chars) or all-caps latin terms ('SiC', 'BP',
+    'EV', 'LNG') match whole-word AND case-sensitively, so 'sic', 'bp' or
+    'ev' in running text do not count. Longer terms: case-insensitive.
+    Ambiguous longer names (Shell, Ford) belong in config in a
+    disambiguated form ('Shell plc', 'Ford Motor').
+    """
+    if not term or not text:
+        return 0
+    if any("\u4e00" <= ch <= "\u9fff" for ch in term):
+        return text.count(term)
+    if len(term) <= _CASE_SENSITIVE_MAX_LEN or (term.isupper() and len(term) > 1):
+        return len(re.findall(rf"(?<!\w){re.escape(term)}(?!\w)", text))
+    return _count_matches(term, text)
+
+
+def topic_score(keywords: Sequence[str], text: str) -> float:
+    """Share of the company's theme covered by ``text`` (0..1).
+
+    Counts DISTINCT ``topic_keywords`` present (case-insensitive, word boundary
+    for latin terms, substring for CJK), 0.15 each, capped at 1.
+    """
+    if not keywords or not text:
+        return 0.0
+    return round(min(1.0, _TOPIC_WEIGHT * topic_hits(keywords, text)), 2)
+
+
+def topic_hits(keywords: Sequence[str], text: str) -> int:
+    """Number of DISTINCT topic keywords present in ``text``."""
+    if not keywords or not text:
+        return 0
+    return sum(1 for kw in keywords if _count_term(kw, text) > 0)
+
+
 @dataclass
 class CompanyMatch:
     company: Company
@@ -110,6 +179,8 @@ class CompanyMatch:
     title_mentions: int
     content_mentions: int
     relevance: float  # 0.0 to 1.0 within the article
+    link_type: str = "direct"  # v010: 'direct' | 'sector' | 'peer'
+    topic_score: float = 0.0
 
 
 @dataclass
@@ -176,7 +247,8 @@ class Classifier:
         """Perform deterministic classification and score computation without DB writes."""
         title_text = title or ""
         body_text = content or ""
-        full_text = f"{title_text}\n{body_text}".lower()
+        raw_text = f"{title_text}\n{body_text}"
+        full_text = raw_text.lower()
 
         # 1. Match companies
         active_companies = self.company_repo.list()
@@ -185,30 +257,77 @@ class Classifier:
         for comp in active_companies:
             aliases = self.company_repo.aliases_for(comp.id) if comp.id else []
             patterns: set[str] = {comp.name}
-            if comp.ticker:
-                patterns.add(comp.ticker)
             for a in aliases:
                 patterns.add(a.term)
 
             t_mentions = sum(_count_matches(p, title_text) for p in patterns)
             c_mentions = sum(_count_matches(p, body_text) for p in patterns)
+            if comp.ticker and comp.ticker not in patterns:
+                t_tick = _count_ticker(comp.ticker, title_text)
+                c_tick = _count_ticker(comp.ticker, body_text)
+                # A short ticker never matches on its own: it only reinforces
+                # a name/alias already found (e.g. 'AI' vs "AI regulation").
+                if len(comp.ticker) > _AMBIGUOUS_TICKER_MAX_LEN or (t_mentions + c_mentions) > 0:
+                    t_mentions += t_tick
+                    c_mentions += c_tick
             total_mentions = t_mentions + c_mentions
+            kws = getattr(comp, "topic_keywords", ()) or ()
+            hits = topic_hits(kws, raw_text)
+            topic = round(min(1.0, _TOPIC_WEIGHT * hits), 2)
 
             if total_mentions > 0:
-                # Calculate intra-article relevance (title match weighs heavily)
-                rel = min(1.0, 0.4 * min(t_mentions, 2) + 0.1 * min(c_mentions, 6))
-                company_matches.append(
-                    CompanyMatch(
-                        company=comp,
-                        mention_count=total_mentions,
-                        title_mentions=t_mentions,
-                        content_mentions=c_mentions,
-                        relevance=rel,
-                    )
+                # direct: one mention is enough; then the THEME decides, not the count.
+                rel = 0.4 + (0.2 if t_mentions > 0 else 0.0) + 0.4 * topic
+                link = "direct"
+            else:
+                peer_hits = 0
+                if hits >= max(1, self.scoring.peer_min_topic_hits):
+                    peer_hits = sum(_count_term(p, raw_text) for p in (getattr(comp, "peers", ()) or ()))
+                if peer_hits > 0:
+                    # peer: a competitor/partner named in an on-topic article
+                    rel, link, total_mentions = 0.1 + 0.4 * topic, "peer", peer_hits
+                elif topic >= self.scoring.topic_link_min:
+                    rel, link = 0.4 * topic, "sector"
+                else:
+                    continue
+            company_matches.append(
+                CompanyMatch(
+                    company=comp,
+                    mention_count=total_mentions,
+                    title_mentions=t_mentions,
+                    content_mentions=c_mentions,
+                    relevance=round(min(1.0, rel), 2),
+                    link_type=link,
+                    topic_score=topic,
                 )
+            )
 
-        # Sort companies by relevance desc
-        company_matches.sort(key=lambda m: (m.title_mentions > 0, m.mention_count), reverse=True)
+        # Thematic links yield to direct links on OTHER tracked companies:
+        # - sector: dropped as soon as another tracked company is named (the
+        #   article is about that company, e.g. an Ecopetrol rating is not
+        #   TotalEnergies sector news);
+        # - peer: kept only when every other directly named tracked company is
+        #   one of this company's peers (a BYD article stays a CATL peer link).
+        direct_names = {m.company.name.casefold() for m in company_matches if m.link_type == "direct"}
+
+        def _keep(m: CompanyMatch) -> bool:
+            if m.link_type == "direct":
+                return True
+            others = direct_names - {m.company.name.casefold()}
+            if not others:
+                return True
+            if m.link_type == "peer":
+                return others <= {p.casefold() for p in (getattr(m.company, "peers", ()) or ())}
+            return False
+
+        company_matches = [m for m in company_matches if _keep(m)]
+
+        # Direct links first (title presence, mentions), then thematic links by relevance
+        company_matches.sort(
+            key=lambda m: (m.link_type == "direct", m.title_mentions > 0, m.relevance, m.mention_count),
+            reverse=True,
+        )
+        direct_matches = [m for m in company_matches if m.link_type == "direct"]
 
         # 2. Match markets
         active_markets = self.market_repo.list()
@@ -224,7 +343,7 @@ class Classifier:
                 market_matches[mkt.id] = MarketMatch(market=mkt, mention_count=mentions, relevance=rel)
 
         # Inherit markets from matched companies
-        for cm in company_matches:
+        for cm in direct_matches:
             if cm.company.id:
                 for comp_mkt, weight in self.company_repo.markets_for(cm.company.id):
                     if comp_mkt.id not in market_matches:
@@ -254,14 +373,19 @@ class Classifier:
 
         # 4. Compute overall relevance_score (0.0 to 1.0)
         relevance_score = 0.0
-        if company_matches:
-            top_c = company_matches[0]
+        best_company_rel = max((m.relevance for m in company_matches), default=0.0)
+        if direct_matches:
+            top_c = direct_matches[0]
             # Base from top company relevance + title presence
             base = 0.5 if top_c.title_mentions > 0 else 0.3
             relevance_score = min(1.0, base + 0.1 * min(top_c.mention_count, 5))
+            relevance_score = max(relevance_score, best_company_rel)
         elif market_list:
             top_m = market_list[0]
             relevance_score = min(0.7, 0.2 + 0.1 * min(top_m.mention_count, 5))
+            relevance_score = max(relevance_score, best_company_rel)
+        elif company_matches:
+            relevance_score = best_company_rel
         else:
             relevance_score = 0.1
 
@@ -315,8 +439,13 @@ class Classifier:
         with self.db.transaction():
             # If no company or market matches and relevance is near 0, flag as unrelated status
             new_status = row["status"]
-            if not comp_matches and not mkt_matches and rel_score < 0.2:
+            if new_status in ("duplicate", "redundant"):
+                pass  # dedup verdicts are final: only links / scores are refreshed
+            elif not comp_matches and not mkt_matches and rel_score < 0.2:
                 new_status = "unrelated"
+            elif new_status == "unrelated" and comp_matches:
+                # reclassify: a sector/peer link makes a former 'unrelated' article relevant
+                new_status = "new"
 
             self.db.execute(
                 "UPDATE article SET relevance_score = ?, importance_level = ?, status = ?, updated_at = ?"
@@ -332,9 +461,9 @@ class Classifier:
             # Insert article_company
             for cm in comp_matches:
                 self.db.execute(
-                    "INSERT INTO article_company (article_id, company_id, mention_count, relevance_in_article)"
-                    " VALUES (?, ?, ?, ?)",
-                    (article_id, cm.company.id, cm.mention_count, cm.relevance),
+                    "INSERT INTO article_company (article_id, company_id, mention_count, relevance_in_article,"
+                    " link_type) VALUES (?, ?, ?, ?, ?)",
+                    (article_id, cm.company.id, cm.mention_count, cm.relevance, cm.link_type),
                 )
 
             # Insert article_market

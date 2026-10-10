@@ -162,13 +162,13 @@ def test_db_migrate_and_version(project, capsys):
     base = ["--config", str(project / "conf" / "config.toml")]
     assert main([*base, "db", "migrate"]) == EXIT_OK
     out = capsys.readouterr().out
-    assert "applied migrations: v001" in out and "v002" in out and "v003" in out
+    assert "applied migrations: v001" in out and "v009" in out
 
     assert main([*base, "db", "migrate"]) == EXIT_OK
-    assert "already at schema version 3" in capsys.readouterr().out
+    assert "already at schema version 11" in capsys.readouterr().out
 
     assert main([*base, "db", "version"]) == EXIT_OK
-    assert "schema version:  3" in capsys.readouterr().out
+    assert "schema version:  11" in capsys.readouterr().out
 
 
 def test_db_migrate_seeds_config_entities(project, capsys):
@@ -199,10 +199,66 @@ def test_cli_status_command(project, capsys):
     assert "1 companies" in out
     assert "=== Execution Locks ===" in out
     assert "=== Last Run ===" in out
+    assert "=== Last Run — Articles by Source ===" in out
     assert "=== LLM Service ===" in out
     # Verify no secrets leak
     assert "WATSONX_API_KEY" not in out
     assert "secret" not in out.lower()
+
+
+def test_cli_status_articles_by_source(project, capsys):
+    """Status shows per-source article counts (stored, duplicate, errors)."""
+    from invest_watch.article_repository import ArticleRepository
+    from invest_watch.db_manager import utc_now_iso
+
+    base = ["--config", str(project / "conf" / "config.toml")]
+    cfg, db = _cfgdb(project)
+
+    # Insert a source and a run with articles in different statuses.
+    now = utc_now_iso()
+    src_id = db.execute(
+        "INSERT INTO source (name, type, url, active, priority, created_at, updated_at)"
+        " VALUES (?,?,?,1,1,?,?)",
+        ("Brave Search", "search", "https://api.search.brave.com", now, now),
+    ).lastrowid
+    repo = ArticleRepository(db)
+    run = repo.create_run("2026-09-20", "2026-09-19T00:00:00Z", "2026-09-19T23:59:59Z")
+
+    def _art(suffix, status):
+        url = f"https://example.com/{suffix}"
+        db.execute(
+            "INSERT INTO article"
+            " (run_id, source_id, url_original, url_normalized, title, short_code,"
+            "  status, relevance_score, date_certaine, collected_at, created_at, updated_at)"
+            " VALUES (?,?,?,?,?,?,?,0.8,0,?,?,?)",
+            (run.id, src_id, url, url, f"Title {suffix}", f"sc{suffix}",
+             status, now, now, now),
+        )
+
+    _art("a1", "new")
+    _art("a2", "new")
+    _art("a3", "duplicate")
+
+    # Insert a processing error linked to the same source and run.
+    db.execute(
+        "INSERT INTO processing_error"
+        " (run_id, source_id, step, error_type, retry_count, status, message, created_at, updated_at)"
+        " VALUES (?,?,'collect','http_403',0,'new','403 Forbidden',?,?)",
+        (run.id, src_id, now, now),
+    )
+    db.close()
+
+    assert main([*base, "status"]) == EXIT_OK
+    out = capsys.readouterr().out
+
+    assert "=== Last Run — Articles by Source ===" in out
+    assert "Brave Search" in out
+    # 2 stored (new), 1 duplicate, 1 error
+    lines = [l for l in out.splitlines() if "Brave Search" in l]
+    assert lines, "Brave Search row missing from source table"
+    row = lines[0]
+    assert "2" in row   # stored
+    assert "1" in row   # duplicate (and errors share the same count)
 
 
 def test_cli_errors_command(project, capsys):
@@ -344,4 +400,53 @@ def test_alias_via_invest_watch_home(project, capsys, monkeypatch):
     assert main(["company", "add", "--name", "BYD"]) == EXIT_OK
     cfg, db = _cfgdb(project)
     assert CompanyRepository(db).get_by_name("BYD") is not None
+    db.close()
+# ─────────────────────────────────────────────────────────────────────────────
+# P1 items 9 + 11 — run --trigger / --retry-degraded wiring
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_run_trigger_is_persisted(project, capsys):
+    """``run --trigger scheduler`` is recorded in ``daily_run.trigger`` (P1 item 9)."""
+    base = ["--config", str(project / "conf" / "config.toml")]
+
+    assert main([*base, "run", "--date", "2026-09-12", "--trigger", "scheduler"]) == EXIT_OK
+    capsys.readouterr()
+
+    cfg, db = _cfgdb(project)
+    row = db.query_one("SELECT trigger, status FROM daily_run ORDER BY id DESC LIMIT 1")
+    assert row is not None
+    assert row["trigger"] == "scheduler"
+    assert row["status"] in ("completed", "partial", "degraded")
+    db.close()
+
+
+def test_run_retry_degraded_requires_resume(project, capsys):
+    """``run --retry-degraded`` without ``--resume`` is rejected (P1 item 11)."""
+    base = ["--config", str(project / "conf" / "config.toml")]
+
+    assert main([*base, "run", "--retry-degraded"]) == EXIT_NOT_IMPLEMENTED
+    assert "--resume" in capsys.readouterr().err
+
+
+def test_report_retry_degraded_resumes_latest_run(project, capsys):
+    """``report --retry-degraded`` re-runs the LLM pipeline on the latest run."""
+    from invest_watch.article_repository import ArticleRepository
+
+    base = ["--config", str(project / "conf" / "config.toml")]
+    cfg, db = _cfgdb(project)
+    repo = ArticleRepository(db)
+    run = repo.create_run("2026-09-12", "2026-09-11T00:00:00Z", "2026-09-11T23:59:59Z")
+    repo.finish_run(run.id, status="completed", error_count=0, stats_json="{}")
+    db.close()
+
+    assert main([*base, "report", "--retry-degraded"]) == EXIT_OK
+    out = capsys.readouterr().out
+    assert f"Retrying LLM summarisation of degraded articles (run #{run.id})" in out
+    assert "# invest-watch — Report of 2026-09-12" in out
+
+    # A resume with --retry-degraded IS a retry → trigger updated in the DB.
+    cfg, db = _cfgdb(project)
+    row = db.query_one("SELECT trigger FROM daily_run WHERE id = ?", (run.id,))
+    assert row["trigger"] == "retry"
     db.close()

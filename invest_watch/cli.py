@@ -26,6 +26,7 @@ from .bootstrap import ensure_directories, open_database, seed_from_config
 from .company_repository import Company, CompanyRepository
 from .config_manager import AppConfig, load_config
 from .exceptions import InvestWatchError
+from .finnhub_symbols import normalize_finnhub_symbol, warn_if_bare_ticker
 from .logger import get_logger, setup_logging
 from .market_repository import _print_tree, Market, MarketRepository
 from .source_repository import Source, SourceRepository
@@ -53,6 +54,13 @@ def _add_company_parser(sub) -> None:
     add.add_argument("--name", required=True, help="company name (unique, case-insensitive)")
     add.add_argument("--legal-name", dest="legal_name")
     add.add_argument("--ticker")
+    add.add_argument(
+        "--finnhub-symbol",
+        dest="finnhub_symbol",
+        metavar="SYMBOL",
+        help="curated Finnhub API symbol (e.g. AIQUY, SPCX, 03750.HK); "
+        "omit when the listing is not served by the plan",
+    )
     add.add_argument("--isin")
     add.add_argument("--country", dest="country_code")
     add.add_argument("--currency")
@@ -72,6 +80,12 @@ def _add_company_parser(sub) -> None:
     edit.add_argument("--rename", dest="name")
     edit.add_argument("--legal-name", dest="legal_name")
     edit.add_argument("--ticker")
+    edit.add_argument(
+        "--finnhub-symbol",
+        dest="finnhub_symbol",
+        metavar="SYMBOL",
+        help="curated Finnhub API symbol (e.g. AIQUY, SPCX, 03750.HK); use '' to clear",
+    )
     edit.add_argument("--isin")
     edit.add_argument("--country", dest="country_code")
     edit.add_argument("--currency")
@@ -169,11 +183,19 @@ def _add_db_parser(sub) -> None:
 def _add_workflow_parsers(sub) -> None:
     report = sub.add_parser("report", help="display latest report (or for a specific date)")
     report.add_argument("--date", metavar="YYYY-MM-DD", help="report date (YYYY-MM-DD)")
+    report.add_argument("--retry-degraded", action="store_true",
+                        help="re-run LLM summarisation of this run's degraded articles"
+                             " (llm_used=0), regenerate digests + report, then display it")
 
     sub.add_parser("status", help="database state, last run, LLM availability, lock")
 
     errors = sub.add_parser("errors", help="recent processing errors")
     errors.add_argument("--limit", type=int, default=20, help="maximum errors to show (default: 20)")
+    errors.add_argument("--group-by", choices=["type", "host", "none"], default="type",
+                        help="grouping summary shown after the list (default: type)")
+
+    doctor = sub.add_parser("doctor", help="pre-flight check of watsonx / Finnhub / Brave keys")
+    doctor.add_argument("--json", action="store_true", help="machine-readable output")
 
     export = sub.add_parser("export", help="export a report (Markdown or JSON)")
     export.add_argument("--format", choices=["md", "json"], default="md", help="export format (default: md)")
@@ -183,6 +205,19 @@ def _add_workflow_parsers(sub) -> None:
     search.add_argument("query", help="search phrase or FTS5 query terms")
 
     sub.add_parser("stop", help="write data/stop.flag to request clean shutdown")
+
+    reclassify = sub.add_parser(
+        "reclassify", help="re-run the classifier (company links, scores) on stored articles"
+    )
+    reclassify.add_argument("--since", metavar="YYYY-MM-DD", required=True,
+                            help="articles published (or collected) on/after this date")
+
+    weekly = sub.add_parser("weekly", help="weekly per-company summaries (one LLM call per company)")
+    weekly.add_argument("--week", metavar="YYYY-Www", help="ISO week (default: last complete week)")
+    weekly.add_argument("--company", metavar="NAME", help="only this company")
+    weekly.add_argument("--force", action="store_true", help="re-summarise companies already done by the LLM")
+    weekly.add_argument("--dry-run", action="store_true",
+                        help="show what would be sent to the LLM (articles, prompt size) - no call")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -208,6 +243,11 @@ def build_parser() -> argparse.ArgumentParser:
                      help="resume an interrupted run by its run_id")
     run.add_argument("--force", action="store_true",
                      help="override a live run.lock (stale process recovery)")
+    run.add_argument("--trigger", choices=["scheduler", "manual", "retry"], default="manual",
+                     help="what triggered this run — stored in daily_run.trigger (default: manual)")
+    run.add_argument("--retry-degraded", action="store_true",
+                     help="with --resume: re-run LLM summarisation of articles llm_used=0,"
+                          " then regenerate digests + report (trigger becomes 'retry')")
     _add_workflow_parsers(sub)
     return parser
 
@@ -275,6 +315,14 @@ def _cmd_company_add(args: Namespace, cfg: AppConfig, db) -> int:
         if market.id is not None:
             markets.append((market.id, weight))
 
+    finnhub_symbol = normalize_finnhub_symbol(args.finnhub_symbol) if args.finnhub_symbol else None
+    warn_if_bare_ticker(
+        args.name,
+        args.ticker,
+        finnhub_symbol,
+        country=args.country_code,
+        currency=args.currency,
+    )
     company = company_repo.add(
         Company(
             name=args.name,
@@ -286,6 +334,7 @@ def _cmd_company_add(args: Namespace, cfg: AppConfig, db) -> int:
             website=args.website,
             primary_market_id=primary_market_id,
             summary=args.summary,
+            finnhub_symbol=finnhub_symbol,
             active=not args.inactive,
         ),
         markets=markets,
@@ -310,13 +359,16 @@ def _cmd_company_list(args: Namespace, cfg: AppConfig, db) -> int:
                 company.id,
                 company.name,
                 company.ticker or "",
+                company.finnhub_symbol or "",
                 company.isin or "",
                 company.country_code or "",
                 market_names,
                 _fmt_bool(company.active),
             ]
         )
-    _print_table(["id", "name", "ticker", "isin", "country", "markets", "active"], rows)
+    _print_table(
+        ["id", "name", "ticker", "finnhub", "isin", "country", "markets", "active"], rows
+    )
     return EXIT_OK
 
 
@@ -330,6 +382,9 @@ def _cmd_company_edit(args: Namespace, cfg: AppConfig, db) -> int:
         value = getattr(args, key)
         if value is not None:
             fields[key] = value
+    if getattr(args, "finnhub_symbol", None) is not None:
+        # '' is the documented way to clear it; stored as SQL NULL ("not covered").
+        fields["finnhub_symbol"] = normalize_finnhub_symbol(args.finnhub_symbol)
     if args.active is not None:
         fields["active"] = args.active
     if args.primary_market is not None:
@@ -340,6 +395,14 @@ def _cmd_company_edit(args: Namespace, cfg: AppConfig, db) -> int:
 
     if fields:
         company = company_repo.update(company.id, **fields)
+
+    warn_if_bare_ticker(
+        company.name,
+        args.ticker if args.ticker is not None else company.ticker,
+        company.finnhub_symbol,
+        country=args.country_code if args.country_code is not None else company.country_code,
+        currency=args.currency if args.currency is not None else company.currency,
+    )
 
     for term in args.remove_alias:
         company_repo.remove_alias(company.id, term)
@@ -554,12 +617,19 @@ def _cmd_run(args: Namespace, cfg: AppConfig, db) -> int:
     from .run_manager import EXIT_COMPLETED, EXIT_PARTIAL, EXIT_FAILED
 
     resume_id: int | None = int(args.resume) if args.resume else None
+    retry_degraded = bool(getattr(args, "retry_degraded", False))
+    if retry_degraded and resume_id is None:
+        print("--retry-degraded requires --resume RUN_ID "
+              "(there is nothing to retry on a fresh run)", file=sys.stderr)
+        return EXIT_NOT_IMPLEMENTED
     rc = orchestrate(
         cfg,
         db,
         run_date=args.date or None,
         resume_run_id=resume_id,
         force=bool(args.force),
+        trigger=args.trigger,
+        retry_degraded=retry_degraded,
     )
 
     # Print a one-line summary drawn from daily_run (may be absent on lock-exit).
@@ -579,7 +649,8 @@ def _cmd_run(args: Namespace, cfg: AppConfig, db) -> int:
         import json as _json
         stats_d = _json.loads(run_row.stats_json) if run_row.stats_json else {}
         print(
-            f"run #{run_row.id} {run_row.run_date}  status={run_row.status}\n"
+            f"run #{run_row.id} {run_row.run_date}  status={run_row.status}"
+            f"  trigger={run_row.trigger or 'manual'}\n"
             f"period {run_row.period_start} → {run_row.period_end} ({cfg.app.timezone})\n"
             f"queries={stats_d.get('queries', 0)} "
             f"harvested={stats_d.get('harvested', 0)} "
@@ -589,6 +660,11 @@ def _cmd_run(args: Namespace, cfg: AppConfig, db) -> int:
             f"robots={stats_d.get('skipped_robots', 0)} "
             f"fetch_errors={stats_d.get('fetch_errors', 0)}"
         )
+        # P1 item 10 — LLM counters in the one-line summary too.
+        llm_used = stats_d.get("llm_used", 0)
+        llm_degraded = stats_d.get("llm_degraded", 0)
+        if llm_used or llm_degraded:
+            print(f"llm_used={llm_used} llm_degraded={llm_degraded}")
         errors = stats_d.get("error_count", 0)
         if errors:
             print(f"errors: {errors} (see `invest-watch errors`)")
@@ -614,6 +690,32 @@ def _cmd_stop(args: Namespace, cfg: AppConfig, db) -> int:
 def _cmd_report(args: Namespace, cfg: AppConfig, db) -> int:
     from .report_generator import ReportConfig, ReportGenerator
     report_date = args.date
+
+    # ── P1 item 11 — --retry-degraded: re-summarise llm_used=0 articles ───
+    if getattr(args, "retry_degraded", False):
+        if report_date:
+            run_row = db.query_one(
+                "SELECT id, run_date FROM daily_run WHERE run_date = ?"
+                " ORDER BY id DESC LIMIT 1",
+                (report_date,),
+            )
+        else:
+            run_row = db.query_one(
+                "SELECT id, run_date FROM daily_run ORDER BY run_date DESC, id DESC LIMIT 1"
+            )
+        if run_row is None:
+            print("no runs found in database — nothing to retry", file=sys.stderr)
+            return EXIT_ERROR
+        from .orchestrator import run as orchestrate
+        from .run_manager import EXIT_COMPLETED, EXIT_PARTIAL, EXIT_FAILED
+        run_id = int(run_row["id"])
+        print(f"Retrying LLM summarisation of degraded articles (run #{run_id})...")
+        rc = orchestrate(cfg, db, resume_run_id=run_id, retry_degraded=True, trigger="retry")
+        if rc not in (EXIT_COMPLETED, EXIT_PARTIAL):
+            print(f"retry failed for run #{run_id} (exit {rc})", file=sys.stderr)
+            return EXIT_ERROR
+        report_date = run_row["run_date"]
+
     if report_date:
         run_row = db.query_one("SELECT * FROM daily_run WHERE run_date = ? ORDER BY id DESC LIMIT 1", (report_date,))
     else:
@@ -690,6 +792,50 @@ def _cmd_status(args: Namespace, cfg: AppConfig, db) -> int:
         print("No runs recorded yet.")
     print()
 
+    # ── Articles by source for the last run ───────────────────────────────
+    print("=== Last Run — Articles by Source ===")
+    if last_run:
+        run_id = last_run["id"]
+
+        # Articles grouped by source × status (stored = new+updated, duplicate).
+        src_rows = db.query(
+            "SELECT COALESCE(s.name, '(no source)') AS source,"
+            "       SUM(CASE WHEN a.status IN ('new','updated') THEN 1 ELSE 0 END) AS stored,"
+            "       SUM(CASE WHEN a.status = 'duplicate' THEN 1 ELSE 0 END) AS duplicate"
+            " FROM article a"
+            " LEFT JOIN source s ON s.id = a.source_id"
+            " WHERE a.run_id = ?"
+            " GROUP BY s.id"
+            " ORDER BY stored DESC, duplicate DESC",
+            (run_id,),
+        )
+
+        # Errors grouped by source for the same run.
+        err_rows = db.query(
+            "SELECT COALESCE(s.name, '(no source)') AS source, COUNT(*) AS errors"
+            " FROM processing_error pe"
+            " LEFT JOIN source s ON s.id = pe.source_id"
+            " WHERE pe.run_id = ?"
+            " GROUP BY s.id",
+            (run_id,),
+        )
+        err_by_source: dict[str, int] = {r["source"]: r["errors"] for r in err_rows}
+
+        if src_rows:
+            _print_table(
+                ["source", "stored", "duplicate", "errors"],
+                [
+                    [r["source"], r["stored"], r["duplicate"],
+                     err_by_source.get(r["source"], 0)]
+                    for r in src_rows
+                ],
+            )
+        else:
+            print("(no articles for this run)")
+    else:
+        print("(no runs recorded yet)")
+    print()
+
     print("=== LLM Service ===")
     print(f"LLM enabled:        {cfg.llm.enabled}")
     print(f"Model ID:           {cfg.llm.model}")
@@ -706,6 +852,8 @@ def _cmd_status(args: Namespace, cfg: AppConfig, db) -> int:
 
 
 def _cmd_errors(args: Namespace, cfg: AppConfig, db) -> int:
+    from .report_generator import _host_of_message  # shared URL-host extractor
+
     limit = args.limit
     rows = db.query(
         "SELECT pe.*, dr.run_date, s.name AS source_name "
@@ -729,13 +877,76 @@ def _cmd_errors(args: Namespace, cfg: AppConfig, db) -> int:
             r["id"],
             f"#{r['run_id']} ({date_str})" if r["run_id"] else "",
             r["step"],
+            r["error_type"] or "",
             r["source_name"] or "",
             r["retry_count"],
             r["status"],
             msg,
         ])
-    _print_table(["id", "run", "step", "source", "retries", "status", "message"], table_rows)
+    _print_table(
+        ["id", "run", "step", "type", "source", "retries", "status", "message"],
+        table_rows,
+    )
+
+    # ── P1 item 7 — grouping by error type / failing host ────────────────
+    group_by = getattr(args, "group_by", "type") or "type"
+    if group_by == "none":
+        return EXIT_OK
+
+    all_rows = db.query(
+        "SELECT pe.error_type, pe.message, pe.step, pe.status "
+        " FROM processing_error pe WHERE pe.status != 'resolved'"
+    )
+    if not all_rows:
+        return EXIT_OK
+
+    if group_by == "host":
+        buckets: dict[str, int] = {}
+        for r in all_rows:
+            host = _host_of_message(r["message"])
+            key = host or (r["step"] or "unknown")
+            buckets[key] = buckets.get(key, 0) + 1
+        label = "host"
+    else:
+        buckets = {}
+        for r in all_rows:
+            key = r["error_type"] or "unknown"
+            buckets[key] = buckets.get(key, 0) + 1
+        label = "type"
+
+    total = sum(buckets.values())
+    ordered = sorted(buckets.items(), key=lambda kv: (-kv[1], kv[0]))
+    print(f"\nSummary by {label} ({total} unresolved error(s)):")
+    for key, count in ordered:
+        print(f"  {key}: {count}")
     return EXIT_OK
+
+
+def _cmd_doctor(args: Namespace, cfg: AppConfig, db) -> int:
+    """Pre-flight pings of watsonx / Finnhub / Brave (P1 item 8)."""
+    import json as _json
+
+    from .doctor import format_doctor_report, run_preflight
+
+    pings = run_preflight(cfg, db=db, check_symbols=True)
+    if getattr(args, "json", False):
+        print(_json.dumps(
+            [
+                {"service": p.service, "ok": p.ok, "status": p.status, "message": p.message}
+                for p in pings
+            ],
+            indent=2,
+        ))
+    else:
+        print(format_doctor_report(pings))
+        bad = [p for p in pings if not p.ok]
+        if bad:
+            print(
+                "\nAction: fix the failing key(s) in .env, then re-run. "
+                "During `invest-watch run` the affected service is skipped cleanly "
+                "with an 'invalid key' message instead of raw 403 errors."
+            )
+    return EXIT_OK if all(p.ok for p in pings) else EXIT_ERROR
 
 
 def _cmd_export(args: Namespace, cfg: AppConfig, db) -> int:
@@ -774,6 +985,80 @@ def _cmd_export(args: Namespace, cfg: AppConfig, db) -> int:
         content = chosen_path.read_text(encoding="utf-8")
 
     print(content)
+    return EXIT_OK
+
+
+def _cmd_weekly(args: Namespace, cfg: AppConfig, db, *, llm_client=None) -> int:
+    """`invest-watch weekly` - one LLM call per company over an ISO week."""
+    from .weekly import WeeklySummarizer, build_weekly_llm_client, group_counts, iso_week
+
+    try:
+        week = iso_week(args.week)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    client = llm_client
+    if client is None and not args.dry_run:
+        client = build_weekly_llm_client(cfg)
+    summarizer = WeeklySummarizer(
+        db, cfg.weekly, llm_client=client, model_id=cfg.llm.model, reports_dir=cfg.storage.reports_dir,
+    )
+    try:
+        results = summarizer.run(week, company=args.company, force=args.force, dry_run=args.dry_run)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    print(f"weekly {week.label} ({week.start.isoformat()} -> {week.end.isoformat()})")
+    for r in results:
+        if args.dry_run:
+            state = "dry-run"
+        elif r.skipped:
+            state = "deja fait (LLM)"
+        elif r.llm_used:
+            state = "LLM"
+        elif not r.articles:
+            state = "aucun article"
+        else:
+            state = "degrade" + (f" ({r.error})" if r.error else "")
+        gc = group_counts(r.articles)
+        split = f"(d={gc['direct']:>2} s={gc['sector']:>2} p={gc['peer']:>2})"
+        print(f"  {r.company_name:<32} articles={len(r.articles):>3} {split} prompt={len(r.prompt):>6} chars  {state}")
+    if not args.dry_run:
+        used = sum(1 for r in results if r.llm_used and not r.skipped)
+        print(f"LLM calls: {used}  report: {cfg.storage.reports_dir / 'weekly' / (week.label + '.md')}")
+    return EXIT_OK
+
+
+def _cmd_reclassify(args: Namespace, cfg: AppConfig, db) -> int:
+    """`invest-watch reclassify --since` - recompute company links on stored articles."""
+    import datetime as _dt
+
+    from .classifier import LINK_TYPES, Classifier
+
+    try:
+        since = _dt.date.fromisoformat(args.since).isoformat()
+    except ValueError:
+        print(f"error: invalid --since {args.since!r} (expected YYYY-MM-DD)", file=sys.stderr)
+        return EXIT_ERROR
+    seed_from_config(db, cfg)  # topic_keywords / peers from config.toml
+    rows = db.query(
+        # every status: duplicate/redundant rows keep their status but get their
+        # company links refreshed (stale links from older classifier rules).
+        "SELECT id FROM article WHERE 1 = 1"
+        " AND substr(COALESCE(published_at, collected_at), 1, 10) >= ? ORDER BY id",
+        (since,),
+    )
+    classifier = Classifier(db, cfg.scoring)
+    counts = {t: 0 for t in LINK_TYPES}
+    unrelated = 0
+    for r in rows:
+        result = classifier.classify_article(int(r["id"]))
+        if not result.companies and not result.markets:
+            unrelated += 1
+        for cm in result.companies:
+            counts[cm.link_type] = counts.get(cm.link_type, 0) + 1
+    print(f"reclassified {len(rows)} article(s) since {since}")
+    print("links: " + "  ".join(f"{t}={counts[t]}" for t in LINK_TYPES) + f"  (no link: {unrelated})")
     return EXIT_OK
 
 
@@ -850,11 +1135,14 @@ _DB_HANDLERS = {
     ("db", "version"): _cmd_db_version,
     ("run", None): _cmd_run,
     ("stop", None): _cmd_stop,
+    ("doctor", None): _cmd_doctor,
     ("report", None): _cmd_report,
     ("status", None): _cmd_status,
     ("errors", None): _cmd_errors,
     ("export", None): _cmd_export,
     ("search", None): _cmd_search,
+    ("weekly", None): _cmd_weekly,
+    ("reclassify", None): _cmd_reclassify,
 }
 
 
@@ -866,8 +1154,30 @@ def _run_stub(command: str, args: Namespace) -> int:
     return EXIT_NOT_IMPLEMENTED
 
 
+def _make_console_streams_unicode_safe() -> None:
+    """Never let an unencodable console print crash the CLI.
+
+    ``invest-watch run``'s one-line summary prints ``→`` and ``—``.  On a
+    Windows console using a legacy code page (cp1252), ``print`` raised
+    ``UnicodeEncodeError`` and masked both the run result and the exit code
+    (observed 2026-09-15 with a redirected ``cmd.exe`` invocation).  Setting
+    ``errors="replace"`` degrades unencodable glyphs to ``?`` instead of
+    raising; the encoding itself is left untouched so terminals that do handle
+    UTF-8 keep the proper characters (e.g. Windows Terminal / PowerShell 7).
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue  # pytest capture or another non-reconfigurable stream
+        try:
+            reconfigure(errors="replace")
+        except (ValueError, OSError):
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point (console script and ``python -m invest_watch``)."""
+    _make_console_streams_unicode_safe()
     parser = build_parser()
     args = parser.parse_args(argv)
 

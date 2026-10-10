@@ -9,14 +9,28 @@ Key behaviours
 --------------
 - **Off mode** (``llm.enabled = false``): every call raises :exc:`LLMDegradedError`
   immediately — no network, no SDK import.
+- **Chat endpoint**: all SDK calls go through ``ModelInference.chat()`` (the
+  ``/ml/v1/text/chat`` endpoint) via :class:`_SDKChatModel`.  The legacy
+  ``/ml/v1/text/generation`` endpoint is deprecated *and* feeds the raw prompt
+  to the model without any chat template — instruct models then continue the
+  prompt's rule list instead of answering (run #2, 2026-09-15: 51/51 articles
+  degraded, instruction leakage inside digests).
 - **Per-run content-hash cache**: second ``generate()`` call with the same
   ``content_hash`` returns the cached result without any network call (§8.6).
 - **Retries + backoff**: 5xx / timeout / network errors → up to ``max_retries``
   retries with delays from :class:`~invest_watch.error_manager.ExponentialBackoff`
   (2 s, 8 s, 30 s by default). 4xx / quota errors → no retry (§8.5).
+- **Truncation**: ``finish_reason=length`` raises :exc:`LLMTruncatedError`
+  immediately — a corrective attempt would truncate again.
+- **Robust JSON parsing** (:func:`extract_json_payload`): markdown fences and
+  preamble/commentary text around the object are stripped before
+  ``json.loads``; on failure the first 300 characters of the raw output are
+  logged and kept in :attr:`WatsonxLLMClient.last_raw_output`.
 - **Circuit-breaker**: delegates to :class:`~invest_watch.error_manager.CircuitBreaker`;
-  ``circuit_breaker_threshold`` consecutive failures → OPEN →
-  :exc:`LLMDegradedError` for the rest of the run.  Resets on
+  ``circuit_breaker_threshold`` consecutive *transport* failures → OPEN, and
+  the same number of consecutive ``generate_json()`` unparseable outputs
+  manually trips the circuit (prompt/model mismatch guard — spec §8.5).
+  :exc:`LLMDegradedError` is then raised for the rest of the run.  Resets on
   :meth:`WatsonxLLMClient.reset_circuit_breaker`.
 - **Lazy SDK init**: ``ibm_watsonx_ai`` is imported only on the first real call,
   so the application starts even when the package is absent (degraded mode).
@@ -26,6 +40,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -40,6 +55,16 @@ logger = logging.getLogger(__name__)
 
 class LLMDegradedError(Exception):
     """Raised when the LLM is unavailable: off mode, circuit open, or exhausted retries."""
+
+
+class LLMTruncatedError(LLMDegradedError):
+    """Raised when the model hit the token limit (finish_reason=length).
+
+    Deliberately a subclass of :exc:`LLMDegradedError` (callers degrade) but
+    with a distinct type so logs/processing_error can tell "output truncated —
+    raise llm.max_new_tokens" apart from a transport failure.  Not retried:
+    a corrective attempt would truncate again.
+    """
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -59,7 +84,9 @@ class LLMClientConfig:
     url: str = "https://eu-de.ml.cloud.ibm.com"
     project_id: str = ""
     api_key: str = ""                              # from env only — never TOML
-    max_new_tokens: int = 700
+    # 3000: article-JSON stops at EOS (~600-900 tokens); per-company/market
+    # digests (up to 25 article blocks each) legitimately need 1200+.
+    max_new_tokens: int = 3000
     temperature: float = 0.1
     top_p: float = 0.9
     timeout_seconds: int = 120
@@ -67,6 +94,120 @@ class LLMClientConfig:
     circuit_breaker_threshold: int = 3
     # Injected in tests to skip real sleeps
     _backoff_delays: list[float] | None = field(default=None, repr=False)
+
+
+# ── JSON payload extraction (robust to fences / preamble text) ────────────────
+
+
+_FENCE_RE = re.compile(r"```[a-zA-Z0-9_-]*\s*")
+
+
+def extract_json_payload(raw: str) -> dict[str, Any]:
+    """Extract and parse a JSON object from an LLM response.
+
+    Handles the common LLM quirks that make ``json.loads`` fail on an
+    otherwise-correct payload:
+    * Markdown code fences (`` ```json ... ``` ``)
+    * Preamble / commentary text before or after the object
+    * Trailing commas are NOT fixed — truly malformed JSON still raises.
+
+    Raises:
+        json.JSONDecodeError (or ValueError): no balanced JSON object found.
+    """
+    if raw is None:
+        raise ValueError("empty LLM response")
+    text = _FENCE_RE.sub("", raw).replace("```", "").strip()
+    try:
+        result = json.loads(text)
+    except json.JSONDecodeError:
+        result = None
+    if isinstance(result, dict):
+        return result
+    # Locate the outermost balanced {...} block and retry.
+    start = text.find("{")
+    if start == -1:
+        raise ValueError(f"no JSON object found in response: {text[:200]!r}")
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                candidate = text[start : i + 1]
+                return json.loads(candidate)  # raises JSONDecodeError if broken
+    raise ValueError(f"unbalanced JSON object in response: {text[:200]!r}")
+
+
+# ── SDK chat adapter ──────────────────────────────────────────────────────────
+
+
+class _SDKChatModel:
+    """Adapter exposing a ``generate(prompt=...)`` surface over the SDK chat API.
+
+    The watsonx.ai ``/ml/v1/text/generation`` endpoint is deprecated and — more
+    importantly — it feeds the raw prompt to the model *without any chat
+    template*.  Instruct models (e.g. Mistral Small 3.1) then continue the
+    prompt's "rules" section instead of answering, producing unparseable
+    output.  Routing through ``ModelInference.chat()`` (i.e. the
+    ``/ml/v1/text/chat`` endpoint with proper system/user messages) fixes both
+    the deprecation warning and the degenerate completions.
+    """
+
+    def __init__(self, model: Any, config: "LLMClientConfig") -> None:
+        self._model = model
+        self._cfg = config
+
+    def generate(self, *, prompt: str) -> dict:
+        from ibm_watsonx_ai.foundation_models.schema import TextChatParameters  # type: ignore[import-untyped]
+
+        params = TextChatParameters(
+            max_tokens=self._cfg.max_new_tokens,
+            temperature=self._cfg.temperature,
+            top_p=self._cfg.top_p,
+        )
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a precise financial-news analyst. Follow the "
+                    "user's instructions exactly and never repeat or paraphrase "
+                    "the instructions themselves in your answer."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ]
+        response = self._model.chat(messages=messages, params=params)
+        # Defensive shape check — chat returns {"choices": [{"message": {...}}]}.
+        choices = response.get("choices") if isinstance(response, dict) else None
+        if not choices:
+            raise RuntimeError(f"unexpected chat response shape: {str(response)[:200]}")
+        choice = choices[0]
+        finish_reason = (choice.get("finish_reason") or "").lower()
+        if finish_reason == "length":
+            # Raise immediately (no retry): a corrective attempt would truncate again.
+            raise LLMTruncatedError(
+                "LLM output truncated (finish_reason=length) — "
+                f"increase llm.max_new_tokens (current: {self._cfg.max_new_tokens})"
+            )
+        message = choice.get("message") or {}
+        content = message.get("content")
+        if content is None:
+            raise RuntimeError(f"empty chat message content: {str(response)[:200]}")
+        return {"results": [{"generated_text": str(content)}]}
 
 
 # ── WatsonxLLMClient ──────────────────────────────────────────────────────────
@@ -97,6 +238,16 @@ class WatsonxLLMClient:
             threshold=config.circuit_breaker_threshold,
             name="llm",
         )
+
+        # Consecutive generate_json() failures (both the original and the
+        # corrective attempt returned unparseable JSON).  When it reaches the
+        # circuit-breaker threshold the circuit is opened — this is the
+        # prompt/model mismatch guard (run #2 of 2026-09-15 burned 51 × 2 calls).
+        self._json_failure_streak = 0
+
+        # Head of the last unparseable raw response — kept for post-mortem
+        # (`invest-watch errors` / log inspection).
+        self._last_raw_output: str | None = None
 
     # ── public interface ──────────────────────────────────────────────────
 
@@ -215,14 +366,17 @@ class WatsonxLLMClient:
         """
         raw = self.generate(prompt, content_hash=content_hash)
 
-        # First parse attempt
+        # First parse attempt — tolerant of fences / preamble text
         try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
+            parsed = extract_json_payload(raw)
+            self._json_failure_streak = 0
+            return parsed
+        except (json.JSONDecodeError, ValueError):
             logger.warning(
                 "LLM returned invalid JSON (hash=%.12s…); sending corrective prompt",
                 content_hash or "none",
             )
+            self._last_raw_output = raw
 
         # One corrective attempt — no content_hash to avoid caching the bad result
         corrective_prompt = (
@@ -231,20 +385,38 @@ class WatsonxLLMClient:
         )
         try:
             corrected = self.generate(corrective_prompt)
-            result = json.loads(corrected)
+            result = extract_json_payload(corrected)
             logger.info(
                 "LLM corrective attempt succeeded (hash=%.12s…)", content_hash or "none"
             )
+            self._json_failure_streak = 0
             # Cache the corrected result under the original hash
             if content_hash:
                 self._cache[content_hash] = corrected
             return result
-        except json.JSONDecodeError as exc:
+        except (json.JSONDecodeError, ValueError) as exc:
+            self._json_failure_streak += 1
             logger.error(
                 "LLM corrective attempt also returned invalid JSON "
-                "(hash=%.12s…) — switching to degraded mode",
+                "(hash=%.12s…) — consecutive JSON failures: %d/%d — switching to degraded mode",
                 content_hash or "none",
+                self._json_failure_streak,
+                self._cfg.circuit_breaker_threshold,
             )
+            logger.error(
+                "LLM raw output head (hash=%.12s…): %.300s",
+                content_hash or "none",
+                (corrected or "").replace("\n", " "),
+            )
+            self._last_raw_output = corrected
+            if self._json_failure_streak >= self._cfg.circuit_breaker_threshold:
+                logger.error(
+                    "LLM JSON failures reached circuit-breaker threshold (%d) — opening circuit",
+                    self._cfg.circuit_breaker_threshold,
+                )
+                self._cb.trip_open(
+                    f"{self._json_failure_streak} consecutive unparseable JSON responses"
+                )
             raise LLMDegradedError(
                 "LLM returned unparseable JSON after corrective attempt"
             ) from exc
@@ -267,12 +439,24 @@ class WatsonxLLMClient:
         """Number of entries currently in the per-run content-hash cache."""
         return len(self._cache)
 
+    @property
+    def last_raw_output(self) -> str | None:
+        """Head of the last unparseable raw LLM response (post-mortem aid)."""
+        return self._last_raw_output
+
+    @property
+    def json_failure_streak(self) -> int:
+        """Consecutive generate_json() failures (0 after a success)."""
+        return self._json_failure_streak
+
     # ── orchestrator control ──────────────────────────────────────────────
 
     def reset_circuit_breaker(self) -> None:
-        """Reset circuit-breaker and cache — called by the orchestrator at run start."""
+        """Reset circuit-breaker, JSON-failure streak and cache — run start."""
         self._cb.reset()
         self._cache.clear()
+        self._json_failure_streak = 0
+        self._last_raw_output = None
 
     # ── lazy SDK init ─────────────────────────────────────────────────────
 
@@ -281,6 +465,8 @@ class WatsonxLLMClient:
 
         The import is deferred so that the application starts normally even
         when ``ibm-watsonx-ai`` is not installed (degraded / off mode).
+        The raw SDK model is wrapped in :class:`_SDKChatModel` so all calls go
+        through the ``/ml/v1/text/chat`` endpoint (see that class for why).
         """
         if self._model is not None:
             return self._model
@@ -288,7 +474,6 @@ class WatsonxLLMClient:
         try:
             from ibm_watsonx_ai import Credentials  # type: ignore[import-untyped]
             from ibm_watsonx_ai.foundation_models import ModelInference  # type: ignore[import-untyped]
-            from ibm_watsonx_ai.metanames import GenTextParamsMetaNames as GenParams  # type: ignore[import-untyped]
         except ImportError as exc:
             raise LLMDegradedError(
                 "ibm-watsonx-ai SDK not installed — run: pip install ibm-watsonx-ai"
@@ -298,19 +483,16 @@ class WatsonxLLMClient:
             url=self._cfg.url,
             api_key=self._cfg.api_key,
         )
-        params = {
-            GenParams.MAX_NEW_TOKENS: self._cfg.max_new_tokens,
-            GenParams.TEMPERATURE: self._cfg.temperature,
-            GenParams.TOP_P: self._cfg.top_p,
-        }
-        self._model = ModelInference(
+        raw_model = ModelInference(
             model_id=self._cfg.model_id,
             credentials=credentials,
-            params=params,
             project_id=self._cfg.project_id,
         )
+        self._model = _SDKChatModel(raw_model, self._cfg)
         logger.info(
-            "LLM initialised: model=%s url=%s", self._cfg.model_id, self._cfg.url
+            "LLM initialised: model=%s url=%s (endpoint: /ml/v1/text/chat)",
+            self._cfg.model_id,
+            self._cfg.url,
         )
         return self._model
 
@@ -321,6 +503,46 @@ class WatsonxLLMClient:
 def build_llm_client(config: LLMClientConfig) -> WatsonxLLMClient:
     """Production factory. Replace with a stub in tests."""
     return WatsonxLLMClient(config)
+
+
+class DisabledLLMClient:
+    """LLM client that is unusable from the start (pre-flight detected a bad key).
+
+    Installed by the orchestrator when :func:`~invest_watch.doctor.watsonx_invalid`
+    is True.  Every call raises :exc:`LLMDegradedError` carrying the reason —
+    the whole run degrades **immediately and silently** instead of burning one
+    raw 403 per article.  ``is_degraded`` is always True, so
+    :class:`~invest_watch.summarizer.ArticleSummarizer` short-circuits without
+    touching the network and without writing a ``processing_error`` row per
+    article (the skip is a clean, expected degradation, not a failure).
+    """
+
+    def __init__(self, reason: str) -> None:
+        #: Why the LLM is unavailable (surfaced in degraded summaries & logs).
+        self.degraded_reason = reason
+
+    @property
+    def is_degraded(self) -> bool:
+        return True
+
+    @property
+    def cache_size(self) -> int:
+        return 0
+
+    @property
+    def last_raw_output(self) -> str | None:
+        return None
+
+    def reset_circuit_breaker(self) -> None:
+        """No-op — the client is permanently disabled."""
+
+    def generate(self, prompt: str, content_hash: str | None = None) -> str:
+        raise LLMDegradedError(self.degraded_reason)
+
+    def generate_json(
+        self, prompt: str, content_hash: str | None = None
+    ) -> dict[str, Any]:
+        raise LLMDegradedError(self.degraded_reason)
 
 
 def llm_client_config_from_section(section: Any) -> LLMClientConfig:

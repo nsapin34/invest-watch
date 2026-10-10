@@ -1,4 +1,4 @@
-﻿# ── Runtime data (generated at runtime, not committed) ───────────────────────
+# ── Runtime data (generated at runtime, not committed) ───────────────────────
 data/
 logs/
 reports/
@@ -36,3 +36,13 @@ htmlcov/
 *.swo
 .DS_Store
 Thumbs.db
+# ── Local diagnostic / probe scratch files ───────────────────────────────────
+_*.py
+_*.bat
+_*.txt
+pytest*.txt
+probe_*.txt
+
+
+# config backups
+conf/*.bak-*

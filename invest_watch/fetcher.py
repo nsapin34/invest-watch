@@ -217,6 +217,7 @@ class Fetcher:
         kind: str = "page",
         extra_headers: dict[str, str] | None = None,
         check_robots: bool | None = None,
+        timeout_seconds: float | None = None,
     ) -> FetchResult:
         """GET ``url``. ``kind='feed'`` uses the shorter timeout and skips robots.txt."""
         if check_robots is None:
@@ -225,7 +226,7 @@ class Fetcher:
             logger.info("robots.txt disallows %s", url)
             return FetchResult(url=url, url_final=url, status_code=None, disallowed=True, error="robots_disallowed")
 
-        timeout_s = self.feed_timeout if kind == "feed" else self.page_timeout
+        timeout_s = timeout_seconds or (self.feed_timeout if kind == "feed" else self.page_timeout)
         timeout = httpx.Timeout(timeout_s, connect=_CONNECT_TIMEOUT)
         host = host_of(url)
         headers = {"User-Agent": self.user_agent}

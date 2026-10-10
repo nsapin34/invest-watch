@@ -32,7 +32,9 @@ from invest_watch.summarizer import (
     ArticleSummarizer,
     ArticleSummary,
     SummarizerConfig,
+    _MAX_LLM_ERROR_ROWS_PER_RUN,
     _degraded_summary,
+    _record_llm_error,
     build_article_prompt,
     validate_article_json,
 )
@@ -594,3 +596,67 @@ class TestArticleSummarySerialization:
         )
         text = s.to_text_content()
         assert "dégradé" in text
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests: LLM error persistence in processing_error (P0 — run #2 was invisible)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestLLMErrorPersistence:
+    """Run #2 (2026-09-15): 29 errors existed but none reached processing_error."""
+
+    def _make(self, db, stub):
+        return ArticleSummarizer(db, stub, _make_cfg())
+
+    def test_llm_call_failure_recorded(self, db):
+        run_id = _insert_run(db)
+        article_id = _insert_article(db, run_id=run_id, relevance=0.8)
+        summarizer = self._make(db, LLMStub(raise_after=0))
+
+        summarizer.summarise_article(article_id, run_id)
+
+        rows = db.query(
+            "SELECT * FROM processing_error WHERE run_id=? AND step='summarise'",
+            (run_id,),
+        )
+        assert len(rows) == 1
+        assert rows[0]["error_type"] == "llm_call_failed"
+        assert rows[0]["article_id"] == article_id
+        assert rows[0]["status"] == "new"
+
+    def test_schema_failure_recorded(self, db):
+        run_id = _insert_run(db)
+        article_id = _insert_article(db, run_id=run_id, relevance=0.8)
+        stub = LLMStub(responses=['["not", "a", "dict"]'])
+        summarizer = self._make(db, stub)
+
+        summarizer.summarise_article(article_id, run_id)
+
+        rows = db.query(
+            "SELECT error_type FROM processing_error WHERE run_id=? AND step='summarise'",
+            (run_id,),
+        )
+        assert [r["error_type"] for r in rows] == ["llm_schema_invalid"]
+
+    def test_capped_at_10_rows_per_run(self, db):
+        run_id = _insert_run(db)
+        for i in range(12):
+            _record_llm_error(db, run_id, None, f"failure {i}")
+
+        rows = db.query(
+            "SELECT id FROM processing_error WHERE run_id=? AND step='summarise'",
+            (run_id,),
+        )
+        assert len(rows) == _MAX_LLM_ERROR_ROWS_PER_RUN
+
+    def test_valid_payload_records_nothing(self, db):
+        run_id = _insert_run(db)
+        _insert_article(db, run_id=run_id, relevance=0.8)
+        stub = LLMStub(responses=[json.dumps(_VALID_PAYLOAD)])
+        summarizer = self._make(db, stub)
+
+        summarizer.summarise_run(run_id)
+
+        rows = db.query("SELECT id FROM processing_error WHERE run_id=?", (run_id,))
+        assert rows == []

@@ -239,6 +239,20 @@ class CircuitBreaker:
                 f"{self._failure_count} consecutive failures"
             ) from exc
 
+    def trip_open(self, reason: str = "") -> None:
+        """Force the breaker OPEN (manual trip).
+
+        For failure modes retrying cannot fix — e.g. N consecutive unparseable
+        JSON outputs indicate a prompt/model mismatch, not a transient fault.
+        Idempotent: tripping an already-OPEN breaker is a no-op.
+        """
+        if self._state is not CircuitState.OPEN:
+            self._state = CircuitState.OPEN
+            self._opened_at = self._clock()
+            logger.error(
+                "CircuitBreaker[%s] → OPEN (manual trip): %s", self.name, reason
+            )
+
     # ── manual control ────────────────────────────────────────────────────
 
     def reset(self) -> None:

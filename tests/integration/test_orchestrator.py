@@ -15,6 +15,8 @@ Covers:
 - 90-day purge removes old daily_run rows.
 - Backup is written when backup_enabled=True and db is a file DB.
 - LLM disabled → summaries/digests degraded, run still completes.
+- Digest LLM failure (incl. finish_reason=length truncation) → processing_error
+  row + daily_run.llm_status='degraded'; healthy LLM run keeps 'ok'.
 """
 
 from __future__ import annotations
@@ -687,7 +689,134 @@ def test_stop_flag_cleared_after_run(cfg, mem_db):
     assert not stop_flag_exists(cfg.storage.db_path.parent)
 
 
-# ── 15. CLI invest-watch stop ─────────────────────────────────────────────────
+# ── 16. Digest LLM failures → llm_status honesty + persisted rows ──────────
+# Regression guard for run #2 20:48 (7 truncated digests, llm_status stayed
+# 'ok' because only the circuit-breaker was inspected).
+
+
+class _TruncatedDigestStub:
+    """Stub whose digest-shape calls raise LLMTruncatedError, then succeed."""
+
+    def __init__(self, ok_digest_md: str) -> None:
+        self._ok = ok_digest_md
+        self._calls = 0
+
+    @property
+    def is_degraded(self) -> bool:
+        return False  # truncation must NOT trip the circuit
+
+    def reset_circuit_breaker(self) -> None:
+        self._calls = 0
+
+    def generate(self, prompt: str, content_hash: str | None = None) -> str:
+        from invest_watch.llm_client import LLMTruncatedError
+
+        self._calls += 1
+        if self._calls == 1:
+            raise LLMTruncatedError(
+                "LLM output truncated (finish_reason=length) — "
+                "increase llm.max_new_tokens (current: 3000)"
+            )
+        return self._ok
+
+    def generate_json(self, prompt: str, content_hash: str | None = None) -> dict:
+        return json.loads(
+            '{"langue_resume": "fr", "titre_resume": "T", "categorie": "other",'
+            ' "compagnies_concernees": [], "marches_couverts": [], "faits": ["F"],'
+            ' "consequences_potentielles": [], "incertitudes_ou_conflits": [],'
+            ' "verification_humaine_requise": true, "importance": "moyenne",'
+            ' "pertinence": 0.5, "note_contradictions": []}'
+        )
+
+
+def _seed_company_digest_run(mem_db, cfg, fetcher) -> int:
+    """Run a full pipeline seeded with one company + summaries, LLM enabled."""
+    SourceRepository(mem_db).add(
+        Source(name="HKEX", type="rss", url="https://hkex.test/feed.xml")
+    )
+    CompanyRepository(mem_db).add(
+        Company(name="BYD", ticker="BYDDY", country_code="CN")
+    )
+    object.__setattr__(cfg.collect, "use_search_engines", False)
+    object.__setattr__(cfg.llm, "enabled", True)
+    llm = _TruncatedDigestStub("## BYD\\n\\n### Faits rapportés\\n- ok [a1]")
+    rc = orchestrate(cfg, mem_db, run_date="2026-09-12",
+                     fetcher=fetcher, llm_client=llm)
+    assert rc in (EXIT_COMPLETED, EXIT_PARTIAL)
+    return int(mem_db.query_one("SELECT id FROM daily_run")["id"])
+
+
+def test_digest_truncation_marks_llm_status_degraded(cfg, mem_db):
+    """A truncated digest must flip daily_run.llm_status to 'degraded'."""
+    rss  = (RSS  / "hkex_sample.xml").read_bytes()
+    html = (HTML / "article_full.html").read_bytes()
+    fetcher = _make_fetcher(_rss_handler({"hkex": rss, ".xml": rss}, html))
+    try:
+        run_id = _seed_company_digest_run(mem_db, cfg, fetcher)
+    finally:
+        fetcher.close()
+
+    row = mem_db.query_one(
+        "SELECT llm_status FROM daily_run WHERE id = ?", (run_id,)
+    )
+    assert row["llm_status"] == "degraded", (
+        "truncated digest must be visible in llm_status (was 'ok' in run #2)"
+    )
+    digest_rows = mem_db.query(
+        "SELECT error_type FROM processing_error WHERE run_id = ? AND step = 'digest'",
+        (run_id,),
+    )
+    assert digest_rows, "digest failure must leave a processing_error row"
+    assert all(r["error_type"] == "llm_truncated" for r in digest_rows)
+
+
+def test_healthy_run_keeps_llm_status_ok(cfg, mem_db):
+    """A fully healthy LLM run keeps llm_status='ok' (no false degraded)."""
+    rss  = (RSS  / "hkex_sample.xml").read_bytes()
+    html = (HTML / "article_full.html").read_bytes()
+    fetcher = _make_fetcher(_rss_handler({"hkex": rss, ".xml": rss}, html))
+    SourceRepository(mem_db).add(
+        Source(name="HKEX", type="rss", url="https://hkex.test/feed.xml")
+    )
+    CompanyRepository(mem_db).add(
+        Company(name="BYD", ticker="BYDDY", country_code="CN")
+    )
+    object.__setattr__(cfg.collect, "use_search_engines", False)
+    object.__setattr__(cfg.llm, "enabled", True)
+
+    class _OkStub:
+        is_degraded = False
+
+        def reset_circuit_breaker(self) -> None:
+            pass
+
+        def generate(self, prompt: str, content_hash: str | None = None) -> str:
+            return "## BYD\\n\\n### Faits rapportés\\n- Revenue up. [a1]"
+
+        def generate_json(self, prompt: str, content_hash: str | None = None) -> dict:
+            return json.loads(
+                '{"langue_resume": "fr", "titre_resume": "T", "categorie": "other",'
+                ' "compagnies_concernees": [], "marches_couverts": [], "faits": ["F"],'
+                ' "consequences_potentielles": [], "incertitudes_ou_conflits": [],'
+                ' "verification_humaine_requise": true, "importance": "moyenne",'
+                ' "pertinence": 0.5, "note_contradictions": []}'
+            )
+
+    try:
+        rc = orchestrate(cfg, mem_db, run_date="2026-09-12",
+                         fetcher=fetcher, llm_client=_OkStub())
+    finally:
+        fetcher.close()
+
+    assert rc in (EXIT_COMPLETED, EXIT_PARTIAL)
+    n_articles = mem_db.query_one("SELECT COUNT(*) AS n FROM article")["n"]
+    if n_articles == 0:
+        pytest.skip("fixture harvest produced no articles — nothing summarised")
+    row = mem_db.query_one("SELECT llm_status FROM daily_run")
+    assert row["llm_status"] == "ok"
+
+
+# ── 17. CLI invest-watch stop ─────────────────────────────────────────────────
 
 
 def test_cli_stop_writes_flag(tmp_path, capsys):
@@ -722,3 +851,79 @@ def test_cli_stop_idempotent(tmp_path, capsys):
 
     assert cli_main(["--config", str(conf_path), "stop"]) == 0
     assert cli_main(["--config", str(conf_path), "stop"]) == 0
+# ── 18. P1 item 11 — --retry-degraded re-summarises llm_used=0 articles ───────
+
+#: Valid article-summary payload (mirrors ``test_healthy_run_keeps_llm_status_ok``).
+_ARTICLE_JSON = (
+    '{"langue_resume": "fr", "titre_resume": "T", "categorie": "other",'
+    ' "compagnies_concernees": [], "marches_couverts": [], "faits": ["F"],'
+    ' "consequences_potentielles": [], "incertitudes_ou_conflits": [],'
+    ' "verification_humaine_requise": true, "importance": "moyenne",'
+    ' "pertinence": 0.5, "note_contradictions": []}'
+)
+
+
+def test_resume_retry_degraded_reprocesses_degraded_summaries(cfg, mem_db):
+    """P1 item 11 — a degraded summary is re-processed by ``retry_degraded=True``."""
+    from invest_watch.db_manager import utc_now_iso
+    from invest_watch.summarizer import (
+        ArticleSummarizer,
+        summarizer_config_from_section,
+    )
+
+    object.__setattr__(cfg.llm, "enabled", True)
+    repo = ArticleRepository(mem_db)
+    run = repo.create_run("2026-09-12", "2026-09-11T00:00:00Z", "2026-09-11T23:59:59Z")
+    run_id = run.id
+
+    # One relevant article seeded directly — deterministic, no fixture harvest.
+    now = utc_now_iso()
+    cur = mem_db.execute(
+        "INSERT INTO article (run_id, url_original, url_normalized, title, short_code,"
+        " status, relevance_score, content, excerpt, collected_at, date_certaine,"
+        " created_at, updated_at)"
+        " VALUES (?,?,?,?,?,'new',?,?,?,?,0,?,?)",
+        (run_id, "https://example.invalid/byd-q3", "https://example.invalid/byd-q3",
+         "BYD Q3 deliveries hit a record", "scbyd01", 0.9,
+         "BYD delivered a record number of EVs in Q3.", "BYD delivered a record.",
+         now, now, now),
+    )
+    assert int(cur.lastrowid) > 0
+
+    # 1) A degraded summary written by a broken LLM (llm_used=0).
+    sum_cfg = summarizer_config_from_section(
+        cfg.llm, relevance_min=cfg.scoring.relevance_min
+    )
+    first_pass = ArticleSummarizer(
+        mem_db, LLMStub(raise_after=0), sum_cfg
+    ).summarise_run(run_id)
+    assert first_pass and first_pass[0].llm_used is False
+
+    degraded_before = mem_db.query_one(
+        "SELECT COUNT(*) AS n FROM summary"
+        " WHERE run_id = ? AND type = 'article' AND llm_used = 0",
+        (run_id,),
+    )["n"]
+    assert degraded_before == 1
+
+    # Resume after CLASSIFY so the seeded article is not reclassified/filtered.
+    mem_db.execute(
+        "UPDATE daily_run SET checkpoint = 'importance' WHERE id = ?", (run_id,)
+    )
+
+    # 2) Retry with a healthy stub → the degraded row must be replaced.
+    healthy = LLMStub(responses=[_ARTICLE_JSON] * 20)
+    rc = orchestrate(cfg, mem_db, resume_run_id=run_id, retry_degraded=True,
+                     trigger="retry", llm_client=healthy)
+
+    assert rc in (EXIT_COMPLETED, EXIT_PARTIAL)
+    assert healthy.call_count >= 1, "the retry must actually call the LLM"
+    remaining = mem_db.query_one(
+        "SELECT COUNT(*) AS n FROM summary"
+        " WHERE run_id = ? AND type = 'article' AND llm_used = 0",
+        (run_id,),
+    )["n"]
+    assert remaining < degraded_before
+    row = mem_db.query_one("SELECT trigger FROM daily_run WHERE id = ?", (run_id,))
+    assert row["trigger"] == "retry"   # P1 item 9 — the resume is tagged as a retry
+

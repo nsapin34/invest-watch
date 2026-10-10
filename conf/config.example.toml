@@ -22,7 +22,7 @@ backup_enabled = true
 
 [collect]
 period_tolerance_hours      = 6
-min_content_chars           = 200
+min_content_chars           = 500
 max_response_bytes          = 2000000
 rate_limit_requests_per_sec = 0.5
 max_queries_per_run         = 40
@@ -33,6 +33,10 @@ respect_robots              = true
 use_search_engines          = true
 # finnhub_api_key is resolved from FINNHUB_API_KEY in .env — do not set here
 finnhub_api_key             = ""
+# Brave budget cap (req/run). Companies served first; markets fill the rest:
+#   market_slots = max(0, max_brave_queries_per_run - N_active_companies)
+# No adjustment needed when adding companies — markets auto-shrink to zero.
+max_brave_queries_per_run   = 23
 
 [dedup]
 title_similarity       = 0.85
@@ -55,7 +59,15 @@ model                      = "mistralai/mistral-small-3-1-24b-instruct-2503"
 endpoint                   = "https://us-south.ml.cloud.ibm.com"
 project_id                 = "e188863b-4e8e-4e98-b670-c075b82fe3f3"          # set via WATSONX_PROJECT_ID
 max_input_chars            = 8000
-max_new_tokens             = 700
+# 50000: article-JSON answers stop at EOS (~600-900 tokens) so a single cap
+# suffices, but per-company/per-market digests (up to 30 article blocks each,
+# ~5k input tokens) legitimately need far more.  700 truncated every article
+# payload, 1200 truncated the busiest digests (run #2, 2026-09-15), and 3000
+# still truncated the six biggest digests (run #4, 2026-09-17: finish_reason=
+# length on 30-block prompts).  mistral-small-3-1 has a 128k context window and
+# watsonx accepts 50000 here — verified against the live endpoint on 2026-09-17
+# — so this cap now only guards against runaway generation.
+max_new_tokens             = 50000
 temperature                = 0.1
 top_p                      = 0.9
 timeout_seconds            = 120
@@ -70,24 +82,38 @@ backup_count = 5
 
 # ── Sources (also manageable via `invest-watch source add`) ──────────────────
 #
-# Finnhub Company News (free tier — North American + OTC tickers)
-# Requires FINNHUB_API_KEY in .env  →  https://finnhub.io/dashboard
+# Finnhub Company News (free tier — North American + OTC tickers).
+# Requires a REAL FINNHUB_API_KEY in .env  →  https://finnhub.io/dashboard
 [[sources]]
 name     = "Finnhub Company News"
 type     = "api"
 url      = "https://finnhub.io/api/v1/company-news"
 lang     = "en"
 priority = 2
-active   = false        # set true after adding FINNHUB_API_KEY to .env
+active   = true
 
 
+# Brave Web/News Search — real publisher result URLs.
+# Requires a REAL BRAVE_API_KEY in .env  →  https://brave.com/search/api/
+[[sources]]
+name     = "Brave Search"
+type     = "search"
+url      = "https://api.search.brave.com/res/v1/web/search"
+lang     = "en"
+priority = 1
+active   = true
+
+
+# HKEX listed-company RSS — RETIRED: all yearly feed URLs (…/SEHK/YYYY/rss.xml)
+# now return 404 from HKEX (verified 2026-09). Kept as documentation; replace
+# with a working HKEX news feed URL before re-activating.
 [[sources]]
 name     = "HKEX News RSS"
 type     = "rss"
 url      = "https://www1.hkexnews.hk/rss/listedco/listconews/SEHK/2024/rss.xml"
 lang     = "en"
 priority = 2
-active   = true
+active   = false
 
 [[sources]]
 name     = "NBS Press Releases"
@@ -97,24 +123,44 @@ lang     = "en"
 priority = 2
 active   = true
 
+# Google News RSS — DO NOT rely on it for article content. Its /rss/articles/
+# links are disallowed by robots.txt on news.google.com and resolve to a
+# consent/interstitial page for headless clients (the collector filters those
+# pages out). Kept only as an opt-in discovery source; keep active=false
+# unless you explicitly want its candidates.
 [[sources]]
 name     = "google-news-rss"
 type     = "search"
 url      = "https://news.google.com/rss/search?q={query}&hl={lang}&gl=US&ceid=US:{lang}"
 lang     = "*"
 priority = 3
-active   = true
+active   = false
 
 # ── Companies (also manageable via `invest-watch company add`) ───────────────
+#
+# `ticker` is the listing ticker (display, search queries, dedup) — it may be a
+# bare Asian listing code (3750, 2899, 3393) that is NOT a valid Finnhub
+# symbol.  At load time a warning is logged with the qualified suggestion
+# (3750→03750.HK, 300750→300750.SZ, 2899→02899.HK, 601899→601899.SS,
+# 3393→03393.HK); US tickers (HSAI, KSTR) need no suffix.
+# `finnhub_symbol` is the curated Finnhub API symbol for /company-news — an
+# exchange symbol, never free text:
+#   * served on the free tier: AAPL, AIQUY, BYDDY, EC, HSAI, KSTR, SPCX, TTE, WOLF
+#   * NOT served (http_403 "You don't have access to this resource"): every
+#     03750.HK / 300750.SZ / 02899.HK / 601899.SS / 03393.HK / *.T / *.TO
+# Omit `finnhub_symbol` when the listing is not covered: the Finnhub engine then
+# skips the company without issuing any request.  Check your own coverage with
+# `invest-watch doctor`.
 
 [[companies]]
-name    = "BYD"
-ticker  = "BYDDY"
-isin    = "CNE100000296"
-country = "CN"
-website = "https://www.byd.com"
-alias   = ["比亚迪", "BYD Company"]
-langue  = ["zh", "en"]
+name           = "BYD"
+ticker         = "BYDDY"
+finnhub_symbol = "BYDDY"
+isin           = "CNE100000296"
+country        = "CN"
+website        = "https://www.byd.com"
+alias          = ["比亚迪", "BYD Company"]
+langue         = ["zh", "en"]
 
   [[companies.markets]]
   name = "Electric Vehicles"

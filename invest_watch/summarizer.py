@@ -246,6 +246,83 @@ class ArticleSummary:
 # ── Prompt builder ────────────────────────────────────────────────────────────
 
 
+# ── processing_error persistence (capped) ─────────────────────────────────────
+
+
+_MAX_LLM_ERROR_ROWS_PER_RUN = 10
+
+
+def _record_llm_error(
+    db: Any,
+    run_id: int,
+    article_id: int | None,
+    message: str,
+    *,
+    step: str = "summarise",
+    error_type: str = "llm_call_failed",
+    ref_id: int | None = None,
+) -> None:
+    """Persist an LLM failure into ``processing_error`` (P0-2).
+
+    Capped at ``_MAX_LLM_ERROR_ROWS_PER_RUN`` rows per (run, step) so a
+    systematic LLM outage cannot flood the table; the count is still
+    visible via ``daily_run.stats_json`` / the run summary.  Never raises.
+
+    ``article_id`` is ``None`` for digest failures (a digest aggregates many
+    articles): the digest's ``ref_id`` is stored in ``message`` instead.
+    """
+    try:
+        row = db.query_one(
+            "SELECT COUNT(*) AS n FROM processing_error"
+            " WHERE run_id = ? AND step = ?",
+            (run_id, step),
+        )
+        if row and int(row["n"]) >= _MAX_LLM_ERROR_ROWS_PER_RUN:
+            return
+        now = utc_now_iso()
+        db.execute(
+            "INSERT INTO processing_error"
+            "  (run_id, step, article_id, error_type, message, traceback,"
+            "   retry_count, status, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, '', 0, 'new', ?, ?)",
+            (run_id, step, article_id, error_type, message[:500], now, now),
+        )
+    except Exception as db_exc:  # noqa: BLE001 — non-fatal by design
+        logger.warning("_record_llm_error: could not persist error — %s", db_exc)
+
+
+def _digest_llm_failed(
+    db: Any,
+    *,
+    run_id: int,
+    digest_type: str,
+    ref_id: int | None,
+    ref_name: str,
+    exc: BaseException,
+) -> str:
+    """Log + persist a digest LLM failure, returning the degraded error_type.
+
+    Truncation (``finish_reason=length``) gets its own error_type so
+    ``invest-watch errors`` tells "raise llm.max_new_tokens" apart from a
+    transport failure.
+    """
+    from .llm_client import LLMTruncatedError  # local to avoid circular import
+
+    error_type = "llm_truncated" if isinstance(exc, LLMTruncatedError) else "llm_call_failed"
+    label = f"{digest_type} digest '{ref_name}' (ref_id={ref_id})"
+    logger.warning("%s: LLM failed — %s", label, exc)
+    _record_llm_error(
+        db,
+        run_id,
+        None,  # a digest aggregates many articles — no single article_id
+        f"{label}: {exc}",
+        step="digest",
+        error_type=error_type,
+        ref_id=ref_id,
+    )
+    return error_type
+
+
 def build_article_prompt(
     *,
     title: str,
@@ -267,6 +344,9 @@ def build_article_prompt(
 
     return (
         "Tu es un analyste factuel. Tu résumes UNIQUEMENT le contenu fourni.\n"
+        "Rédige TOUJOURS ta réponse en français, même si le texte source est en chinois "
+        "ou en anglais : traduis fidèlement et donne le nom original entre parenthèses "
+        "à la première mention d'une société ou d'une personne.\n"
         "CONTEXTE :\n"
         f"- Compagnies suivies : {companies_str}\n"
         f"- Marchés suivis : {markets_str}\n"
@@ -515,7 +595,8 @@ class ArticleSummarizer:
             ValueError: If ``article_id`` does not exist in the database.
         """
         row = self._db.query_one(
-            "SELECT a.id, a.run_id, a.title, a.content, a.excerpt,"
+            "SELECT a.id, a.run_id, COALESCE(a.title_fr, a.title) AS title,"
+            " COALESCE(a.content_fr, a.content) AS content, a.excerpt,"
             " a.language, a.published_at, a.content_hash, a.relevance_score,"
             " GROUP_CONCAT(DISTINCT c.name) AS company_names,"
             " GROUP_CONCAT(DISTINCT m.name) AS market_names"
@@ -547,7 +628,11 @@ class ArticleSummarizer:
         if not self._cfg.enabled:
             degraded_reason = "LLM disabled"
         elif self._llm.is_degraded:
-            degraded_reason = "circuit-breaker open"
+            # A DisabledLLMClient (pre-flight: invalid key) carries its own
+            # honest reason — surface it instead of the generic breaker line.
+            degraded_reason = (
+                getattr(self._llm, "degraded_reason", None) or "circuit-breaker open"
+            )
         elif relevance_score < self._cfg.relevance_min:
             degraded_reason = f"relevance {relevance_score:.2f} < min {self._cfg.relevance_min:.2f}"
         elif self._call_count >= self._cfg.max_calls_per_run:
@@ -585,6 +670,7 @@ class ArticleSummarizer:
             self._call_count += 1
         except LLMDegradedError as exc:
             logger.warning("article #%d: LLM call failed — %s", article_id, exc)
+            _record_llm_error(self._db, run_id, article_id, f"LLM call failed: {exc}")
             summary = _degraded_summary(
                 title=title,
                 excerpt=excerpt,
@@ -600,6 +686,13 @@ class ArticleSummarizer:
         if not ok or validated is None:
             logger.error(
                 "article #%d: JSON schema validation failed — %s", article_id, error
+            )
+            _record_llm_error(
+                self._db,
+                run_id,
+                article_id,
+                f"schema validation failed: {error}",
+                error_type="llm_schema_invalid",
             )
             summary = _degraded_summary(
                 title=title,
@@ -633,6 +726,7 @@ class ArticleSummarizer:
         *,
         skip_statuses: tuple[str, ...] = ("duplicate", "redundant", "unrelated"),
         resume: bool = False,
+        retry_degraded: bool = False,
     ) -> list[ArticleSummary]:
         """Summarise all eligible articles of a run in ID order.
 
@@ -640,17 +734,47 @@ class ArticleSummarizer:
         (they contain no useful unique information).
 
         Args:
-            run_id:        PK of the ``daily_run`` row.
-            skip_statuses: Article statuses to bypass (default: duplicates, etc.).
-            resume:        When ``True``, skip articles that already have a
-                           ``summary`` row for this run — idempotent on resume so
-                           the LLM is never called twice for the same article.
+            run_id:         PK of the ``daily_run`` row.
+            skip_statuses:  Article statuses to bypass (default: duplicates, etc.).
+            resume:         When ``True``, skip articles that already have a
+                            ``summary`` row for this run — idempotent on resume so
+                            the LLM is never called twice for the same article.
+            retry_degraded: When ``True`` (P1 item 11), articles whose existing
+                            summary row has ``llm_used=0`` are re-processed —
+                            the degraded upsert is simply replaced by a fresh
+                            LLM attempt (``_persist`` replaces the row).  Takes
+                            precedence over ``resume``'s exclusion.
 
         Returns:
             List of :class:`ArticleSummary` objects (one per processed article).
         """
         placeholders = ",".join("?" for _ in skip_statuses)
-        if resume:
+        if retry_degraded:
+            # Re-process every article that is not already a *successful* LLM
+            # summary: unsummarised articles AND llm_used=0 (degraded) ones.
+            rows = self._db.query(
+                f"SELECT id FROM article"
+                f" WHERE run_id = ? AND status NOT IN ({placeholders})"
+                f" AND id NOT IN ("
+                f"   SELECT ref_id FROM summary"
+                f"   WHERE run_id = ? AND type = 'article' AND ref_id IS NOT NULL"
+                f"     AND llm_used = 1"
+                f" )"
+                f" ORDER BY id",
+                (run_id, *skip_statuses, run_id),
+            )
+            n_degraded = self._db.query_one(
+                "SELECT COUNT(*) AS n FROM summary"
+                " WHERE run_id = ? AND type = 'article' AND llm_used = 0",
+                (run_id,),
+            )
+            logger.info(
+                "summarise_run: retry-degraded — %s degraded summary(ies) to re-attempt"
+                " (run #%d)",
+                int(n_degraded["n"]) if n_degraded else 0,
+                run_id,
+            )
+        elif resume:
             # Exclude articles that already have a summary row for this run.
             rows = self._db.query(
                 f"SELECT id FROM article"
@@ -1008,6 +1132,34 @@ def _degraded_global_digest(
     )
 
 
+# ── Digest content hygiene ────────────────────────────────────────────────────
+
+
+_DIGEST_HEADING_RE = re.compile(r"^[ \t]*#{1,3}[ \t]+\S", re.MULTILINE)
+
+
+def _sanitise_digest_content(content: str) -> str:
+    """Strip anything before the digest's first Markdown heading line.
+
+    Run #2 (2026-09-15) showed the model echoing prompt rules ahead of the
+    digest body (e.g. ``Ne pas utiliser de phrases comme "aujourd'hui"…``) —
+    the leak ended up verbatim in the report.  Everything before the first
+    ``##``/``###`` heading line is dropped; content without any heading is
+    returned unchanged (and still flagged in the report as a suspect digest).
+    """
+    if not content:
+        return content
+    match = _DIGEST_HEADING_RE.search(content)
+    if match is None or match.start() == 0:
+        return content
+    logger.warning(
+        "digest content: stripped %d leading character(s) before the first heading "
+        "(model echoed prompt instructions?)",
+        match.start(),
+    )
+    return content[match.start():]
+
+
 # ── DigestSummarizer ──────────────────────────────────────────────────────────
 
 
@@ -1077,7 +1229,16 @@ class DigestSummarizer:
             run_date = row["run_date"] if row else "unknown"
 
         company_digests = self._digest_all_companies(run_id)
-        market_digests = self._digest_all_markets(run_id)
+        # Build the set of article IDs already covered by company digests so that
+        # market digests only receive articles not attributed to any known company.
+        covered_by_companies: frozenset[int] = frozenset(
+            aid for d in company_digests for aid in d.article_ids
+        )
+        logger.debug(
+            "digest_run #%d: %d article(s) covered by company digests — excluded from market digests",
+            run_id, len(covered_by_companies),
+        )
+        market_digests = self._digest_all_markets(run_id, exclude_article_ids=covered_by_companies)
         global_digest = self.digest_global(run_id, run_date=run_date,
                                             company_digests=company_digests,
                                             market_digests=market_digests)
@@ -1137,9 +1298,12 @@ class DigestSummarizer:
 
         prompt = build_company_digest_prompt(company_name, country_code, articles)
         try:
-            content = self._llm_generate_text(prompt)
+            content = _sanitise_digest_content(self._llm_generate_text(prompt))
         except LLMDegradedError as exc:
-            logger.warning("company digest #%d: LLM failed — %s", company_id, exc)
+            _digest_llm_failed(
+                self._db, run_id=run_id, digest_type="company",
+                ref_id=company_id, ref_name=company_name, exc=exc,
+            )
             digest = _degraded_company_digest(
                 run_id=run_id,
                 company_id=company_id,
@@ -1171,19 +1335,24 @@ class DigestSummarizer:
         market_name: str,
         *,
         market_type: str = "sector",
+        exclude_article_ids: frozenset[int] = frozenset(),
     ) -> Digest:
         """Produce and persist a digest for one market/sector.
 
         Args:
-            run_id:      PK of the daily_run.
-            market_id:   PK of the market.
-            market_name: Display name for the Markdown heading.
-            market_type: 'market' | 'sector' | 'industry'.
+            run_id:               PK of the daily_run.
+            market_id:            PK of the market.
+            market_name:          Display name for the Markdown heading.
+            market_type:          'market' | 'sector' | 'industry'.
+            exclude_article_ids:  Article IDs already covered by company digests;
+                                  excluded so each article appears only in the most
+                                  specific digest (company > market).
 
         Returns:
             Persisted :class:`Digest` with ``db_id`` filled.
         """
-        articles = self._load_article_blocks_for_market(run_id, market_id)
+        articles = self._load_article_blocks_for_market(run_id, market_id,
+                                                         exclude_article_ids=exclude_article_ids)
         if not articles:
             digest = Digest(
                 run_id=run_id,
@@ -1214,9 +1383,12 @@ class DigestSummarizer:
 
         prompt = build_market_digest_prompt(market_name, market_type, articles)
         try:
-            content = self._llm_generate_text(prompt)
+            content = _sanitise_digest_content(self._llm_generate_text(prompt))
         except LLMDegradedError as exc:
-            logger.warning("market digest #%d: LLM failed — %s", market_id, exc)
+            _digest_llm_failed(
+                self._db, run_id=run_id, digest_type="market",
+                ref_id=market_id, ref_name=market_name, exc=exc,
+            )
             digest = _degraded_market_digest(
                 run_id=run_id,
                 market_id=market_id,
@@ -1283,9 +1455,12 @@ class DigestSummarizer:
             market_digests=[d.content for d in market_digests],
         )
         try:
-            content = self._llm_generate_text(prompt)
+            content = _sanitise_digest_content(self._llm_generate_text(prompt))
         except LLMDegradedError as exc:
-            logger.warning("global digest: LLM failed — %s", exc)
+            _digest_llm_failed(
+                self._db, run_id=run_id, digest_type="global",
+                ref_id=None, ref_name="global", exc=exc,
+            )
             digest = _degraded_global_digest(
                 run_id=run_id,
                 run_date=run_date,
@@ -1312,11 +1487,15 @@ class DigestSummarizer:
     # ── private helpers ───────────────────────────────────────────────────
 
     def _check_degraded(self) -> str | None:
-        """Return a reason string if the LLM must not be called, else None."""
+        """Return a reason string if the LLM must not be called, else None.
+
+        NOTE: a stub/real client that signals ``is_degraded`` only reflects
+        a global outage.  A single digest failing (truncation, timeout) marks
+        that digest degraded but must NOT poison the remaining digests — so
+        unlike :class:`ArticleSummarizer` we do not gate on ``is_degraded``.
+        """
         if not self._cfg.enabled:
             return "LLM disabled"
-        if self._llm.is_degraded:
-            return "circuit-breaker open"
         if self._counter[0] >= self._cfg.max_calls_per_run:
             return f"per-run cap reached ({self._cfg.max_calls_per_run})"
         return None
@@ -1340,7 +1519,7 @@ class DigestSummarizer:
     ) -> list[_ArticleBlock]:
         """Load article+summary blocks for articles linked to a company in this run."""
         rows = self._db.query(
-            "SELECT a.id, a.short_code, a.title, a.published_at, a.importance_level,"
+            "SELECT a.id, a.short_code, COALESCE(a.title_fr, a.title) AS title, a.published_at, a.importance_level,"
             "       s.name AS source_name,"
             "       sm.content AS summary_content"
             " FROM article a"
@@ -1356,11 +1535,18 @@ class DigestSummarizer:
         return [self._row_to_block(r) for r in rows]
 
     def _load_article_blocks_for_market(
-        self, run_id: int, market_id: int
+        self, run_id: int, market_id: int,
+        exclude_article_ids: frozenset[int] = frozenset(),
     ) -> list[_ArticleBlock]:
-        """Load article+summary blocks for articles linked to a market in this run."""
-        rows = self._db.query(
-            "SELECT a.id, a.short_code, a.title, a.published_at, a.importance_level,"
+        """Load article+summary blocks for articles linked to a market in this run.
+
+        Args:
+            exclude_article_ids: Article IDs already covered by a company digest in
+                this run.  Those articles are excluded so that each article only
+                appears in the most specific digest (company > market).
+        """
+        sql = (
+            "SELECT a.id, a.short_code, COALESCE(a.title_fr, a.title) AS title, a.published_at, a.importance_level,"
             "       s.name AS source_name,"
             "       sm.content AS summary_content"
             " FROM article a"
@@ -1369,10 +1555,15 @@ class DigestSummarizer:
             " LEFT JOIN summary sm ON sm.type = 'article' AND sm.ref_id = a.id AND sm.run_id = a.run_id"
             " WHERE a.run_id = ? AND am.market_id = ?"
             "   AND a.status NOT IN ('duplicate', 'redundant', 'unrelated')"
-            " ORDER BY a.published_at DESC"
-            " LIMIT ?",
-            (run_id, market_id, _MAX_ARTICLES_PER_DIGEST),
         )
+        params: tuple = (run_id, market_id)
+        if exclude_article_ids:
+            placeholders = ",".join("?" * len(exclude_article_ids))
+            sql += f" AND a.id NOT IN ({placeholders})"
+            params += tuple(sorted(exclude_article_ids))
+        sql += " ORDER BY a.published_at DESC LIMIT ?"
+        params += (_MAX_ARTICLES_PER_DIGEST,)
+        rows = self._db.query(sql, params)
         return [self._row_to_block(r) for r in rows]
 
     @staticmethod
@@ -1410,8 +1601,15 @@ class DigestSummarizer:
             digests.append(d)
         return digests
 
-    def _digest_all_markets(self, run_id: int) -> list[Digest]:
-        """Produce market digests for every market that has articles in this run."""
+    def _digest_all_markets(
+        self, run_id: int, exclude_article_ids: frozenset[int] = frozenset()
+    ) -> list[Digest]:
+        """Produce market digests for every market that has articles in this run.
+
+        Args:
+            exclude_article_ids: Article IDs already covered by company digests in
+                this run; passed through to each :meth:`digest_market` call.
+        """
         rows = self._db.query(
             "SELECT DISTINCT m.id, m.name, m.type"
             " FROM market m"
@@ -1428,6 +1626,7 @@ class DigestSummarizer:
                 int(row["id"]),
                 row["name"],
                 market_type=row["type"] or "sector",
+                exclude_article_ids=exclude_article_ids,
             )
             digests.append(d)
         return digests
